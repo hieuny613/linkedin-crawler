@@ -50,7 +50,6 @@ linkedin-crawler/
 │       └── signal.go                 ✅ Signal handling
 ├── .gitignore                        ✅ Git ignore rules
 ├── go.mod                            ✅ Go modules
-├── Makefile                          ✅ Build automation
 └── README.md                         ✅ Documentation
 ```
 
