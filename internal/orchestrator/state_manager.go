@@ -4,7 +4,7 @@ import (
 	"fmt"
 )
 
-// StateManager handles state persistence and management
+// StateManager handles state persistence and management with SQLite
 type StateManager struct {
 	autoCrawler *AutoCrawler
 }
@@ -16,163 +16,132 @@ func NewStateManager(ac *AutoCrawler) *StateManager {
 	}
 }
 
-// HasEmailsToProcess checks if there are emails left to process
+// HasEmailsToProcess checks if there are emails left to process (pending status)
 func (sm *StateManager) HasEmailsToProcess() bool {
-	withData, withoutData, _, permanent := sm.autoCrawler.GetEmailMaps()
-	totalEmails := sm.autoCrawler.GetTotalEmails()
-
-	for _, email := range totalEmails {
-		// If email is not in success maps and not permanently failed, it needs processing
-		if _, hasWithData := withData[email]; !hasWithData {
-			if _, hasWithoutData := withoutData[email]; !hasWithoutData {
-				if _, isPermanent := permanent[email]; !isPermanent {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-// CountRemainingEmails counts how many emails are left to process
-func (sm *StateManager) CountRemainingEmails() int {
-	withData, withoutData, _, permanent := sm.autoCrawler.GetEmailMaps()
-	totalEmails := sm.autoCrawler.GetTotalEmails()
-
-	count := 0
-	for _, email := range totalEmails {
-		if _, hasWithData := withData[email]; !hasWithData {
-			if _, hasWithoutData := withoutData[email]; !hasWithoutData {
-				if _, isPermanent := permanent[email]; !isPermanent {
-					count++
-				}
-			}
-		}
-	}
-	return count
-}
-
-// GetRemainingEmails returns the list of emails that still need processing
-func (sm *StateManager) GetRemainingEmails() []string {
-	withData, withoutData, _, permanent := sm.autoCrawler.GetEmailMaps()
-	totalEmails := sm.autoCrawler.GetTotalEmails()
-
-	var remaining []string
-	for _, email := range totalEmails {
-		if _, hasWithData := withData[email]; !hasWithData {
-			if _, hasWithoutData := withoutData[email]; !hasWithoutData {
-				if _, isPermanent := permanent[email]; !isPermanent {
-					remaining = append(remaining, email)
-				}
-			}
-		}
-	}
-	return remaining
-}
-
-// SaveStateOnShutdown saves the current state when shutting down
-func (sm *StateManager) SaveStateOnShutdown() {
-	withData, withoutData, failed, permanent := sm.autoCrawler.GetEmailMaps()
-	totalEmails := sm.autoCrawler.GetTotalEmails()
 	emailStorage, _, _ := sm.autoCrawler.GetStorageServices()
-	config := sm.autoCrawler.GetConfig()
-	fileOpMutex := sm.autoCrawler.GetFileOpMutex()
 
-	// Calculate remaining emails
-	var remainingEmails []string
-	for _, email := range totalEmails {
-		// If email is not successfully processed (both with data and without data) and not permanently failed
-		if _, hasWithData := withData[email]; !hasWithData {
-			if _, hasWithoutData := withoutData[email]; !hasWithoutData {
-				if _, isPermanent := permanent[email]; !isPermanent {
-					remainingEmails = append(remainingEmails, email)
-				}
-			}
-		}
-	}
-
-	// Add failed emails (need retry)
-	for email := range failed {
-		found := false
-		for _, existing := range remainingEmails {
-			if existing == email {
-				found = true
-				break
-			}
-		}
-		if !found {
-			remainingEmails = append(remainingEmails, email)
-		}
-	}
-
-	if len(remainingEmails) == 0 {
-		fmt.Println("📝 Tất cả emails đã được xử lý")
-		// Create empty file with thread-safe operation
-		fileOpMutex.Lock()
-		err := emailStorage.WriteEmailsToFile(config.EmailsFilePath, []string{})
-		fileOpMutex.Unlock()
-		if err != nil {
-			fmt.Printf("⚠️ Không thể tạo file trống: %v\n", err)
-		}
-		return
-	}
-
-	// Write remaining emails to file using thread-safe operation
-	fileOpMutex.Lock()
-	err := emailStorage.WriteEmailsToFile(config.EmailsFilePath, remainingEmails)
-	fileOpMutex.Unlock()
+	pendingEmails, err := emailStorage.GetPendingEmails()
 	if err != nil {
-		fmt.Printf("⚠️ Không thể ghi emails file khi shutdown: %v\n", err)
+		fmt.Printf("⚠️ Không thể kiểm tra pending emails: %v\n", err)
+		return false
+	}
+
+	return len(pendingEmails) > 0
+}
+
+// CountRemainingEmails counts how many emails are left to process (pending status)
+func (sm *StateManager) CountRemainingEmails() int {
+	emailStorage, _, _ := sm.autoCrawler.GetStorageServices()
+
+	pendingEmails, err := emailStorage.GetPendingEmails()
+	if err != nil {
+		fmt.Printf("⚠️ Không thể đếm pending emails: %v\n", err)
+		return 0
+	}
+
+	return len(pendingEmails)
+}
+
+// GetRemainingEmails returns the list of emails that still need processing (pending status)
+func (sm *StateManager) GetRemainingEmails() []string {
+	emailStorage, _, _ := sm.autoCrawler.GetStorageServices()
+
+	pendingEmails, err := emailStorage.GetPendingEmails()
+	if err != nil {
+		fmt.Printf("⚠️ Không thể lấy pending emails: %v\n", err)
+		return []string{}
+	}
+
+	return pendingEmails
+}
+
+// SaveStateOnShutdown saves the current state when shutting down - exports pending emails to file
+func (sm *StateManager) SaveStateOnShutdown() {
+	emailStorage, _, _ := sm.autoCrawler.GetStorageServices()
+	config := sm.autoCrawler.GetConfig()
+
+	// Get current stats
+	stats, err := emailStorage.GetEmailStats()
+	if err != nil {
+		fmt.Printf("⚠️ Không thể lấy stats khi shutdown: %v\n", err)
 		return
 	}
 
-	fmt.Printf("💾 Đã lưu %d emails chưa xử lý (Với data: %d, Không data: %d, Failed: %d, Permanent Failed: %d)\n",
-		len(remainingEmails), len(withData), len(withoutData),
-		len(failed), len(permanent))
+	// Export pending emails back to file
+	err = emailStorage.ExportPendingEmailsToFile(config.EmailsFilePath)
+	if err != nil {
+		fmt.Printf("⚠️ Không thể export pending emails khi shutdown: %v\n", err)
+		return
+	}
+
+	pendingCount := stats["pending"]
+	successCount := stats["success"]
+	failedCount := stats["failed"]
+
+	if pendingCount == 0 {
+		fmt.Println("📝 Tất cả emails đã được xử lý - file emails.txt trống")
+	} else {
+		fmt.Printf("💾 Đã lưu %d emails pending vào file emails.txt\n", pendingCount)
+	}
+
+	fmt.Printf("📊 Tổng kết: Success: %d | Failed: %d | Pending: %d | HasInfo: %d | NoInfo: %d\n",
+		successCount, failedCount, pendingCount, stats["has_info"], stats["no_info"])
+
+	// Close database connection
+	if err := emailStorage.CloseDB(); err != nil {
+		fmt.Printf("⚠️ Lỗi khi đóng database: %v\n", err)
+	}
 }
 
-// UpdateEmailsFile updates the emails file with current state
+// UpdateEmailsFile updates the emails file with pending emails (legacy compatibility)
 func (sm *StateManager) UpdateEmailsFile() {
-	withData, withoutData, failed, permanent := sm.autoCrawler.GetEmailMaps()
-	totalEmails := sm.autoCrawler.GetTotalEmails()
 	emailStorage, _, _ := sm.autoCrawler.GetStorageServices()
 	config := sm.autoCrawler.GetConfig()
-	fileOpMutex := sm.autoCrawler.GetFileOpMutex()
 
-	var remainingEmails []string
-
-	// Add emails that haven't been processed successfully (both with data and without data) and not permanently failed
-	for _, email := range totalEmails {
-		if _, hasWithData := withData[email]; !hasWithData {
-			if _, hasWithoutData := withoutData[email]; !hasWithoutData {
-				if _, isPermanent := permanent[email]; !isPermanent {
-					remainingEmails = append(remainingEmails, email)
-				}
-			}
-		}
-	}
-
-	// Add failed emails (need retry)
-	for email := range failed {
-		found := false
-		for _, existing := range remainingEmails {
-			if existing == email {
-				found = true
-				break
-			}
-		}
-		if !found {
-			remainingEmails = append(remainingEmails, email)
-		}
-	}
-
-	// Use thread-safe file operation
-	fileOpMutex.Lock()
-	err := emailStorage.WriteEmailsToFile(config.EmailsFilePath, remainingEmails)
-	fileOpMutex.Unlock()
+	err := emailStorage.ExportPendingEmailsToFile(config.EmailsFilePath)
 	if err != nil {
 		fmt.Printf("⚠️ Không thể cập nhật emails file: %v\n", err)
-	} else {
-		fmt.Printf("💾 Đã cập nhật file emails: %d emails còn lại\n", len(remainingEmails))
+		return
+	}
+
+	pendingEmails, err := emailStorage.GetPendingEmails()
+	if err != nil {
+		fmt.Printf("⚠️ Không thể lấy pending emails: %v\n", err)
+		return
+	}
+
+	fmt.Printf("💾 Đã cập nhật file emails: %d emails pending còn lại\n", len(pendingEmails))
+}
+
+// GetEmailStats returns current email statistics from SQLite
+func (sm *StateManager) GetEmailStats() (map[string]int, error) {
+	emailStorage, _, _ := sm.autoCrawler.GetStorageServices()
+	return emailStorage.GetEmailStats()
+}
+
+// PrintDetailedStats prints detailed statistics from SQLite
+func (sm *StateManager) PrintDetailedStats() {
+	stats, err := sm.GetEmailStats()
+	if err != nil {
+		fmt.Printf("⚠️ Không thể lấy stats: %v\n", err)
+		return
+	}
+
+	fmt.Printf("📊 Chi tiết thống kê từ SQLite:\n")
+	fmt.Printf("   ✅ Success: %d emails\n", stats["success"])
+	fmt.Printf("   ❌ Failed: %d emails\n", stats["failed"])
+	fmt.Printf("   ⏳ Pending: %d emails\n", stats["pending"])
+	fmt.Printf("   🎯 Có thông tin LinkedIn: %d emails\n", stats["has_info"])
+	fmt.Printf("   📭 Không có thông tin: %d emails\n", stats["no_info"])
+
+	total := stats["success"] + stats["failed"] + stats["pending"]
+	if total > 0 {
+		successPercent := float64(stats["success"]) * 100 / float64(total)
+		fmt.Printf("   📈 Tỷ lệ thành công: %.1f%%\n", successPercent)
+
+		if stats["success"] > 0 {
+			dataPercent := float64(stats["has_info"]) * 100 / float64(stats["success"])
+			fmt.Printf("   🎯 Tỷ lệ có data trong thành công: %.1f%%\n", dataPercent)
+		}
 	}
 }

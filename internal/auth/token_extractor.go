@@ -3,11 +3,8 @@ package auth
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
-
-	"github.com/chromedp/chromedp"
 
 	"linkedin-crawler/internal/models"
 	"linkedin-crawler/internal/storage"
@@ -40,24 +37,10 @@ func (te *TokenExtractor) GetTokenForAccount(account models.Account, accountsFil
 	defer browserCancel()
 
 	// Perform login
-	if err := te.loginService.LoginToTeams(browserCtx, account); err != nil {
+	var cleanToken string
+	if cleanToken, err = te.loginService.LoginToTeams(browserCtx, account); err != nil {
 		return "", fmt.Errorf("lỗi trong quá trình đăng nhập: %v", err)
 	}
-
-	// Extract token
-	var lokiToken string
-	err = chromedp.Evaluate(`sessionStorage.getItem("LokiAuthToken")`, &lokiToken).Do(browserCtx)
-	if err != nil {
-		return "", fmt.Errorf("lỗi khi lấy token: %v", err)
-	}
-
-	if lokiToken == "" {
-		return "", fmt.Errorf("không lấy được LokiAuthToken")
-	}
-
-	cleanToken := strings.ReplaceAll(strings.ReplaceAll(lokiToken, "\"", ""), "\\", "")
-	fmt.Printf("✅ Thành công lấy token cho: %s\n", account.Email)
-
 	// Remove account from file after successful token extraction
 	if rmErr := te.accountStorage.RemoveAccountFromFile(accountsFilePath, account); rmErr != nil {
 		fmt.Printf("⚠️ Không thể xóa account %s: %v\n", account.Email, rmErr)

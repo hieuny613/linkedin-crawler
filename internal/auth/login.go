@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/chromedp/chromedp"
@@ -23,11 +24,11 @@ func NewLoginService() *LoginService {
 }
 
 // LoginToTeams performs login to Microsoft Teams
-func (ls *LoginService) LoginToTeams(ctx context.Context, account models.Account) error {
+func (ls *LoginService) LoginToTeams(ctx context.Context, account models.Account) (string, error) {
 	loginURL := "https://teams.microsoft.com/"
 
 	fmt.Printf("🔑 Đang xử lý account: %s\n", account.Email)
-
+	var lokiToken string
 	err := chromedp.Run(ctx,
 		chromedp.Navigate(loginURL),
 		chromedp.Sleep(3*time.Second),
@@ -77,9 +78,19 @@ func (ls *LoginService) LoginToTeams(ctx context.Context, account models.Account
 		}),
 
 		chromedp.Sleep(5*time.Second),
+		chromedp.Evaluate(`sessionStorage.getItem("LokiAuthToken")`, &lokiToken),
 	)
+	if err != nil {
+		return "", fmt.Errorf("lỗi khi lấy token: %v", err)
+	}
 
-	return err
+	if lokiToken == "" {
+		return "", fmt.Errorf("không lấy được LokiAuthToken")
+	}
+
+	cleanToken := strings.ReplaceAll(strings.ReplaceAll(lokiToken, "\"", ""), "\\", "")
+	fmt.Printf("✅ Thành công lấy token cho: %s\n", account.Email)
+	return cleanToken, nil
 }
 
 // handleChangePassword handles password change requirement

@@ -14,7 +14,7 @@ import (
 	"linkedin-crawler/internal/utils"
 )
 
-// AutoCrawler orchestrates the LinkedIn crawling process
+// AutoCrawler orchestrates the LinkedIn crawling process with SQLite integration
 type AutoCrawler struct {
 	config            models.Config
 	accounts          []models.Account
@@ -31,13 +31,6 @@ type AutoCrawler struct {
 	logChan      chan string
 	logWaitGroup sync.WaitGroup
 
-	// Email tracking maps
-	successEmailsWithData    map[string]struct{} // Emails có thông tin LinkedIn
-	successEmailsWithoutData map[string]struct{} // Emails không có thông tin LinkedIn
-	failedEmails             map[string]struct{} // Emails thất bại cần retry
-	permanentFailed          map[string]struct{} // Emails lỗi vĩnh viễn
-	emailsMutex              sync.Mutex
-
 	// File operation mutex để tránh race condition
 	fileOpMutex sync.Mutex
 
@@ -52,7 +45,7 @@ type AutoCrawler struct {
 	stateManager   *StateManager
 }
 
-// New creates a new AutoCrawler instance
+// New creates a new AutoCrawler instance with SQLite integration
 func New(config models.Config) (*AutoCrawler, error) {
 	outputFile := "hit.txt"
 
@@ -61,12 +54,13 @@ func New(config models.Config) (*AutoCrawler, error) {
 	tokenStorage := storage.NewTokenStorage()
 	accountStorage := storage.NewAccountStorage()
 
-	// Load accounts and emails
+	// Load accounts
 	accounts, err := accountStorage.LoadAccounts(config.AccountsFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load accounts: %w", err)
 	}
 
+	// Load emails and import to SQLite (with validation and deduplication)
 	emails, err := emailStorage.LoadEmailsFromFile(config.EmailsFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load emails: %w", err)
@@ -88,12 +82,6 @@ func New(config models.Config) (*AutoCrawler, error) {
 		logFile:          logFile,
 		logWriter:        bufio.NewWriter(logFile),
 		logChan:          make(chan string, 1000),
-
-		// Initialize email tracking maps
-		successEmailsWithData:    make(map[string]struct{}),
-		successEmailsWithoutData: make(map[string]struct{}),
-		failedEmails:             make(map[string]struct{}),
-		permanentFailed:          make(map[string]struct{}),
 
 		// Initialize storage services
 		emailStorage:   emailStorage,
@@ -126,7 +114,7 @@ func New(config models.Config) (*AutoCrawler, error) {
 	return ac, nil
 }
 
-// Run starts the crawling process
+// Run starts the crawling process with SQLite integration
 func (ac *AutoCrawler) Run() error {
 	defer func() {
 		if atomic.LoadInt32(&ac.shutdownRequested) == 0 {
@@ -135,10 +123,14 @@ func (ac *AutoCrawler) Run() error {
 		}
 	}()
 
-	fmt.Printf("🚀 Bắt đầu Auto LinkedIn Crawler\n")
+	fmt.Printf("🚀 Bắt đầu Auto LinkedIn Crawler với SQLite\n")
 	fmt.Printf("📊 Tổng số accounts: %d\n", len(ac.accounts))
 	fmt.Printf("📧 Tổng số emails: %d\n", len(ac.totalEmails))
 	fmt.Printf("🎯 Sẽ lấy %d tokens mỗi lần\n", ac.config.MaxTokens)
+
+	// Show initial SQLite stats
+	ac.stateManager.PrintDetailedStats()
+
 	fmt.Println(strings.Repeat("=", 80))
 
 	// Phase 1 - Xử lý tất cả emails
@@ -169,60 +161,73 @@ func (ac *AutoCrawler) LogLine(line string) {
 	}
 }
 
-// printFinalResults prints the final crawling results
+// printFinalResults prints the final crawling results using SQLite stats
 func (ac *AutoCrawler) printFinalResults() {
 	fmt.Println("\n" + strings.Repeat("=", 80))
 	fmt.Println("🎉 HOÀN THÀNH AUTO LINKEDIN CRAWLER!")
 	fmt.Println(strings.Repeat("=", 80))
 
-	ac.emailsMutex.Lock()
-	withDataCount := len(ac.successEmailsWithData)
-	withoutDataCount := len(ac.successEmailsWithoutData)
-	failedCount := len(ac.failedEmails)
-	permanentFailedCount := len(ac.permanentFailed)
-	totalProcessed := withDataCount + withoutDataCount + permanentFailedCount
+	// Get final stats from SQLite
+	stats, err := ac.stateManager.GetEmailStats()
+	if err != nil {
+		fmt.Printf("⚠️ Không thể lấy stats cuối cùng: %v\n", err)
+		return
+	}
+
 	totalOriginal := len(ac.totalEmails)
-	ac.emailsMutex.Unlock()
+	successCount := stats["success"]
+	failedCount := stats["failed"]
+	pendingCount := stats["pending"]
+	hasInfoCount := stats["has_info"]
+	noInfoCount := stats["no_info"]
 
 	// Calculate percentages
-	successPercent := float64(withDataCount+withoutDataCount) * 100 / float64(totalOriginal)
+	successPercent := 0.0
+	if totalOriginal > 0 {
+		successPercent = float64(successCount) * 100 / float64(totalOriginal)
+	}
+
 	dataPercent := 0.0
-	if withDataCount+withoutDataCount > 0 {
-		dataPercent = float64(withDataCount) * 100 / float64(withDataCount+withoutDataCount)
+	if successCount > 0 {
+		dataPercent = float64(hasInfoCount) * 100 / float64(successCount)
 	}
 
 	fmt.Printf("📈 TỔNG KẾT CUỐI CÙNG:\n")
-	fmt.Printf("   📊 Tổng emails xử lý:     %d/%d (%.1f%%)\n", totalProcessed, totalOriginal, float64(totalProcessed)*100/float64(totalOriginal))
-	fmt.Printf("   ✅ Thành công:           %d/%d (%.1f%%)\n", withDataCount+withoutDataCount, totalOriginal, successPercent)
+	fmt.Printf("   📊 Tổng emails ban đầu:   %d\n", totalOriginal)
+	fmt.Printf("   ✅ Đã xử lý thành công:  %d (%.1f%%)\n", successCount, successPercent)
+	fmt.Printf("   ❌ Thất bại:             %d\n", failedCount)
+	fmt.Printf("   ⏳ Chưa xử lý:           %d\n", pendingCount)
 	fmt.Printf("   \n")
-	fmt.Printf("   🎯 CÓ THÔNG TIN LINKEDIN: %d emails (%.1f%% trong thành công)\n", withDataCount, dataPercent)
-	fmt.Printf("   📭 KHÔNG CÓ THÔNG TIN:   %d emails (%.1f%% trong thành công)\n", withoutDataCount, 100-dataPercent)
-	fmt.Printf("   \n")
-	fmt.Printf("   ❌ Cần retry:            %d emails\n", failedCount)
-	fmt.Printf("   💀 Lỗi vĩnh viễn:        %d emails\n", permanentFailedCount)
+	fmt.Printf("   🎯 CÓ THÔNG TIN LINKEDIN: %d emails (%.1f%% trong thành công)\n", hasInfoCount, dataPercent)
+	fmt.Printf("   📭 KHÔNG CÓ THÔNG TIN:   %d emails (%.1f%% trong thành công)\n", noInfoCount, 100-dataPercent)
 
-	if withDataCount > 0 {
-		fmt.Printf("\n🎉 TÌM THẤY %d PROFILES LINKEDIN - Kết quả trong file: %s\n", withDataCount, ac.outputFile)
+	if hasInfoCount > 0 {
+		fmt.Printf("\n🎉 TÌM THẤY %d PROFILES LINKEDIN - Kết quả trong file: %s\n", hasInfoCount, ac.outputFile)
 	} else {
 		fmt.Printf("\n😔 Không tìm thấy profile LinkedIn nào\n")
+	}
+
+	if pendingCount > 0 {
+		fmt.Printf("\n💾 Còn %d emails chưa xử lý đã được lưu vào file %s\n", pendingCount, ac.config.EmailsFilePath)
 	}
 
 	fmt.Println(strings.Repeat("=", 80))
 }
 
-// PrintCurrentStats prints current processing statistics
+// PrintCurrentStats prints current processing statistics using SQLite
 func (ac *AutoCrawler) PrintCurrentStats() {
-	ac.emailsMutex.Lock()
-	withData := len(ac.successEmailsWithData)
-	withoutData := len(ac.successEmailsWithoutData)
-	failed := len(ac.failedEmails)
-	permanent := len(ac.permanentFailed)
-	total := len(ac.totalEmails)
-	ac.emailsMutex.Unlock()
+	stats, err := ac.stateManager.GetEmailStats()
+	if err != nil {
+		fmt.Printf("⚠️ Không thể lấy stats: %v\n", err)
+		return
+	}
 
-	processed := withData + withoutData + permanent
-	fmt.Printf("📊 Stats: ✅%d 📭%d ❌%d 💀%d | Progress: %d/%d (%.1f%%)\n",
-		withData, withoutData, failed, permanent, processed, total, float64(processed)*100/float64(total))
+	total := len(ac.totalEmails)
+	processed := stats["success"] + stats["failed"]
+
+	fmt.Printf("📊 Stats: ✅%d 📭%d ❌%d ⏳%d | Progress: %d/%d (%.1f%%)\n",
+		stats["has_info"], stats["no_info"], stats["failed"], stats["pending"],
+		processed, total, float64(processed)*100/float64(total))
 }
 
 // Getter methods for service access
@@ -254,55 +259,27 @@ func (ac *AutoCrawler) GetStorageServices() (*storage.EmailStorage, *storage.Tok
 	return ac.emailStorage, ac.tokenStorage, ac.accountStorage
 }
 
+// Legacy compatibility methods - now using SQLite
 func (ac *AutoCrawler) GetEmailMaps() (map[string]struct{}, map[string]struct{}, map[string]struct{}, map[string]struct{}) {
-	ac.emailsMutex.Lock()
-	defer ac.emailsMutex.Unlock()
-
-	// Return copies to prevent external modification
-	withData := make(map[string]struct{})
-	withoutData := make(map[string]struct{})
-	failed := make(map[string]struct{})
-	permanent := make(map[string]struct{})
-
-	for k, v := range ac.successEmailsWithData {
-		withData[k] = v
-	}
-	for k, v := range ac.successEmailsWithoutData {
-		withoutData[k] = v
-	}
-	for k, v := range ac.failedEmails {
-		failed[k] = v
-	}
-	for k, v := range ac.permanentFailed {
-		permanent[k] = v
-	}
-
-	return withData, withoutData, failed, permanent
+	// Return empty maps since we're using SQLite now
+	return make(map[string]struct{}), make(map[string]struct{}), make(map[string]struct{}), make(map[string]struct{})
 }
 
 func (ac *AutoCrawler) UpdateEmailMaps(withData, withoutData, failed, permanent map[string]struct{}) {
-	ac.emailsMutex.Lock()
-	defer ac.emailsMutex.Unlock()
-
-	ac.successEmailsWithData = withData
-	ac.successEmailsWithoutData = withoutData
-	ac.failedEmails = failed
-	ac.permanentFailed = permanent
+	// No-op since we're using SQLite now
 }
 
 func (ac *AutoCrawler) AddEmailToMap(email string, mapType string) {
-	ac.emailsMutex.Lock()
-	defer ac.emailsMutex.Unlock()
-
+	// Convert to SQLite operations
 	switch mapType {
 	case "withData":
-		ac.successEmailsWithData[email] = struct{}{}
+		ac.emailStorage.UpdateEmailStatus(email, storage.StatusSuccess, true, false)
 	case "withoutData":
-		ac.successEmailsWithoutData[email] = struct{}{}
+		ac.emailStorage.UpdateEmailStatus(email, storage.StatusSuccess, false, true)
 	case "failed":
-		ac.failedEmails[email] = struct{}{}
+		ac.emailStorage.UpdateEmailStatus(email, storage.StatusFailed, false, false)
 	case "permanent":
-		ac.permanentFailed[email] = struct{}{}
+		ac.emailStorage.UpdateEmailStatus(email, storage.StatusFailed, false, false)
 	}
 }
 

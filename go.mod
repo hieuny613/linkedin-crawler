@@ -8,6 +8,7 @@ require (
 	github.com/chromedp/cdproto v0.0.0-20250525213546-24735cbed6af
 	github.com/chromedp/chromedp v0.13.6
 	github.com/google/uuid v1.6.0
+	github.com/mattn/go-sqlite3 v1.14.28
 	golang.org/x/sync v0.14.0
 )
 

@@ -13,6 +13,7 @@ import (
 	"linkedin-crawler/internal/auth"
 	"linkedin-crawler/internal/crawler"
 	"linkedin-crawler/internal/models"
+	"linkedin-crawler/internal/storage"
 )
 
 // BatchProcessor handles batch processing of emails
@@ -199,7 +200,7 @@ func (bp *BatchProcessor) getTokensBatch() ([]string, error) {
 		len(accountsBatch), usedIndex, endIndex-1, tokensNeeded)
 
 	// Process in small batches to avoid overload
-	batchSize := 3
+	batchSize := 5
 	processedAccounts := 0
 
 	for i := 0; i < len(accountsBatch) && len(validTokens) < tokensNeeded; i += batchSize {
@@ -287,7 +288,7 @@ func (bp *BatchProcessor) processEmailsWithTokens(tokens []string) error {
 		}
 	}()
 
-	// Get remaining emails (DO NOT reset to 0)
+	// Get remaining emails from SQLite
 	stateManager := bp.autoCrawler.stateManager
 	remainingEmails := stateManager.GetRemainingEmails()
 
@@ -332,8 +333,16 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 	}
 
 	totalOriginalEmails := len(bp.autoCrawler.GetTotalEmails())
-	withData, withoutData, _, _ := bp.autoCrawler.GetEmailMaps()
-	alreadyProcessed := len(withData) + len(withoutData)
+
+	// Get stats from SQLite
+	emailStorage, _, _ := bp.autoCrawler.GetStorageServices()
+	stats, err := emailStorage.GetEmailStats()
+	if err != nil {
+		fmt.Printf("⚠️ Không thể lấy stats từ database: %v\n", err)
+		stats = make(map[string]int)
+	}
+
+	alreadyProcessed := stats["success"]
 
 	fmt.Printf("🎯 Bắt đầu crawl %d emails với tokens hiện tại...\n", len(emails))
 	fmt.Printf("📊 Tiến độ tổng thể: Đã hoàn thành %d/%d emails (%.1f%%)\n",
@@ -404,16 +413,18 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 					return
 				}
 
-				// Display progress
-				withDataCount, withoutDataCount, failedCount, permanentFailedCount := bp.autoCrawler.GetEmailMaps()
-				totalProcessedGlobal := len(withDataCount) + len(withoutDataCount)
+				// Get current stats from SQLite
+				currentStats, err := emailStorage.GetEmailStats()
+				if err != nil {
+					currentStats = make(map[string]int)
+				}
 
 				batchPercent := 0.0
 				if len(emails) > 0 {
 					batchPercent = float64(batchProcessed) * 100 / float64(len(emails))
 				}
 
-				totalPercent := float64(totalProcessedGlobal) * 100 / float64(totalOriginalEmails)
+				totalPercent := float64(currentStats["success"]) * 100 / float64(totalOriginalEmails)
 
 				// Progress bar
 				barWidth := 25
@@ -433,9 +444,9 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 				line1 := fmt.Sprintf("🔄 Batch: %s %.1f%% (%d/%d) | Success: %d | Failed: %d | Active: %d | Tokens: %d/%d",
 					bar, batchPercent, batchProcessed, len(emails), batchSuccess, batchFailed, activeReqs, validTokenCount, totalTokens)
 
-				line2 := fmt.Sprintf("📊 Total: %.1f%% (%d/%d) | ✅Data: %d | 📭NoData: %d | ❌Failed: %d | 💀Permanent: %d",
-					totalPercent, totalProcessedGlobal, totalOriginalEmails,
-					len(withDataCount), len(withoutDataCount), len(failedCount), len(permanentFailedCount))
+				line2 := fmt.Sprintf("📊 Total: %.1f%% (%d/%d) | ✅Data: %d | 📭NoData: %d | ❌Failed: %d | ⏳Pending: %d",
+					totalPercent, currentStats["success"], totalOriginalEmails,
+					currentStats["has_info"], currentStats["no_info"], currentStats["failed"], currentStats["pending"])
 
 				newDisplay := line1 + "\n" + line2
 
@@ -496,10 +507,10 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 						}
 
 						atomic.AddInt32(&crawlerInstance.Stats.Processed, 1)
-						success := bp.retryEmailWithNewLogic(email, 5)
+						success := bp.retryEmailWithSQLite(email, 5)
 
 						if !success {
-							bp.autoCrawler.LogLine(fmt.Sprintf("💾 Email %s thất bại sau 5 lần retry - giữ lại trong file", email))
+							bp.autoCrawler.LogLine(fmt.Sprintf("💾 Email %s thất bại sau 5 lần retry - đánh dấu failed trong DB", email))
 						}
 					}
 				}
@@ -527,8 +538,11 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 
 		fmt.Printf("✅ Hoàn thành batch: Processed: %d | Success: %d | Failed: %d\n", processed, success, failed)
 
-		withData, withoutData, _, _ := bp.autoCrawler.GetEmailMaps()
-		fmt.Printf("📊 Current totals: ✅Data: %d | 📭NoData: %d\n", len(withData), len(withoutData))
+		// Get final stats from SQLite
+		finalStats, err := emailStorage.GetEmailStats()
+		if err == nil {
+			fmt.Printf("📊 Current totals: ✅Data: %d | 📭NoData: %d\n", finalStats["has_info"], finalStats["no_info"])
+		}
 
 		return int(processed), nil
 
@@ -536,8 +550,6 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 		statusTicker.Stop()
 		fmt.Fprintf(os.Stderr, "\r\033[A\033[K\033[K\r")
 		fmt.Println()
-
-		bp.autoCrawler.stateManager.UpdateEmailsFile()
 
 		processed := int32(0)
 		crawlerInstance := bp.autoCrawler.GetCrawler()
@@ -554,12 +566,11 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 	}
 }
 
-// retryEmailWithNewLogic retries email with new logic - distinguishes between data and no data
-func (bp *BatchProcessor) retryEmailWithNewLogic(email string, maxRetries int) bool {
+// retryEmailWithSQLite retries email with SQLite integration
+func (bp *BatchProcessor) retryEmailWithSQLite(email string, maxRetries int) bool {
 	config := bp.autoCrawler.GetConfig()
 	crawlerInstance := bp.autoCrawler.GetCrawler()
 	emailStorage, _, _ := bp.autoCrawler.GetStorageServices()
-	fileOpMutex := bp.autoCrawler.GetFileOpMutex()
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		if atomic.LoadInt32(bp.autoCrawler.GetShutdownRequested()) == 1 {
@@ -570,6 +581,8 @@ func (bp *BatchProcessor) retryEmailWithNewLogic(email string, maxRetries int) b
 			allTokensFailed := crawlerInstance.AllTokensFailed
 			if allTokensFailed {
 				bp.autoCrawler.LogLine(fmt.Sprintf("❌ Tất cả tokens đã bị lỗi, dừng retry cho email: %s", email))
+				// Update status to failed in SQLite
+				emailStorage.UpdateEmailStatus(email, storage.StatusFailed, false, false)
 				return false
 			}
 
@@ -588,23 +601,19 @@ func (bp *BatchProcessor) retryEmailWithNewLogic(email string, maxRetries int) b
 			bp.autoCrawler.LogLine(fmt.Sprintf("Retry %d/%d - Email: %s | Status: %d | Response: %s",
 				attempt, maxRetries, email, statusCode, snippet))
 
-			// Distinguish between data and no data
+			// Process successful response
 			if statusCode == 200 {
-				// Remove email from file first - THREAD SAFE
-				fileOpMutex.Lock()
-				removeErr := emailStorage.RemoveEmailFromFile(config.EmailsFilePath, email)
-				fileOpMutex.Unlock()
-				if removeErr != nil {
-					bp.autoCrawler.LogLine(fmt.Sprintf("⚠️ Không thể xóa email %s khỏi file: %v", email, removeErr))
-				}
-
 				if hasProfile {
 					// Check if there's actual profile data
 					profileExtractor := crawler.NewProfileExtractor()
 					profile, parseErr := profileExtractor.ExtractProfileData(body)
 					if parseErr == nil && profile.User != "" && profile.User != "null" && profile.User != "{}" {
 						// HAS LINKEDIN INFO
-						bp.autoCrawler.AddEmailToMap(email, "withData")
+						err := emailStorage.UpdateEmailStatus(email, storage.StatusSuccess, true, false)
+						if err != nil {
+							bp.autoCrawler.LogLine(fmt.Sprintf("⚠️ Không thể cập nhật status trong DB cho email %s: %v", email, err))
+						}
+
 						bp.autoCrawler.LogLine(fmt.Sprintf("✅ Email có thông tin LinkedIn: %s | User: %s | URL: %s",
 							email, profile.User, profile.LinkedInURL))
 
@@ -613,26 +622,33 @@ func (bp *BatchProcessor) retryEmailWithNewLogic(email string, maxRetries int) b
 						atomic.AddInt32(&crawlerInstance.Stats.Success, 1)
 					} else {
 						// NO LINKEDIN INFO (200 response but no useful data)
-						bp.autoCrawler.AddEmailToMap(email, "withoutData")
+						err := emailStorage.UpdateEmailStatus(email, storage.StatusSuccess, false, true)
+						if err != nil {
+							bp.autoCrawler.LogLine(fmt.Sprintf("⚠️ Không thể cập nhật status trong DB cho email %s: %v", email, err))
+						}
+
 						bp.autoCrawler.LogLine(fmt.Sprintf("📭 Email không có thông tin LinkedIn: %s", email))
 						atomic.AddInt32(&crawlerInstance.Stats.Success, 1)
 					}
 				} else {
 					// NO LINKEDIN INFO
-					bp.autoCrawler.AddEmailToMap(email, "withoutData")
+					err := emailStorage.UpdateEmailStatus(email, storage.StatusSuccess, false, true)
+					if err != nil {
+						bp.autoCrawler.LogLine(fmt.Sprintf("⚠️ Không thể cập nhật status trong DB cho email %s: %v", email, err))
+					}
+
 					bp.autoCrawler.LogLine(fmt.Sprintf("📭 Email không có thông tin LinkedIn: %s", email))
 					atomic.AddInt32(&crawlerInstance.Stats.Success, 1)
 				}
 
-				bp.autoCrawler.LogLine(fmt.Sprintf("🗑️ Đã xóa email khỏi file: %s", email))
 				return true
 			}
 
-			// If not last attempt and not successful, wait 100-500ms before retry
+			// If not last attempt and not successful, wait before retry
 			if attempt < maxRetries {
-				// Random delay between 100-500ms
+				// Random delay between 200-600ms
 				r := rand.New(rand.NewSource(time.Now().UnixNano()))
-				delayMs := 200 + r.Intn(401) // 100 + (0-400) = 100-500ms
+				delayMs := 200 + r.Intn(401) // 200 + (0-400) = 200-600ms
 				delay := time.Duration(delayMs) * time.Millisecond
 
 				bp.autoCrawler.LogLine(fmt.Sprintf("⏳ Chờ %dms trước khi retry lần %d cho email: %s", delayMs, attempt+1, email))
@@ -641,8 +657,12 @@ func (bp *BatchProcessor) retryEmailWithNewLogic(email string, maxRetries int) b
 		}
 	}
 
-	// After retrying 5 times and still not successful
-	bp.autoCrawler.LogLine(fmt.Sprintf("❌ Email %s thất bại sau %d lần retry - Giữ lại trong file", email, maxRetries))
+	// After retrying maxRetries times and still not successful
+	bp.autoCrawler.LogLine(fmt.Sprintf("❌ Email %s thất bại sau %d lần retry - Đánh dấu failed trong DB", email, maxRetries))
+
+	// Update status to failed in SQLite
+	emailStorage.UpdateEmailStatus(email, storage.StatusFailed, false, false)
+
 	crawlerInstance = bp.autoCrawler.GetCrawler()
 	if crawlerInstance != nil {
 		atomic.AddInt32(&crawlerInstance.Stats.Failed, 1)

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"linkedin-crawler/internal/crawler"
+	"linkedin-crawler/internal/storage"
 )
 
 // RetryHandler handles retry logic for failed emails
@@ -19,22 +20,46 @@ func NewRetryHandler(ac *AutoCrawler) *RetryHandler {
 	}
 }
 
-// RetryFailedEmails handles Phase 2 retry - processes ALL remaining emails from file
+// RetryFailedEmails handles Phase 2 retry - processes failed emails from SQLite
 func (rh *RetryHandler) RetryFailedEmails() error {
 	maxRetry := 7
+	emailStorage, tokenStorage, _ := rh.autoCrawler.GetStorageServices()
 
 	for i := 1; i <= maxRetry; i++ {
-		emailStorage, tokenStorage, _ := rh.autoCrawler.GetStorageServices()
 		config := rh.autoCrawler.GetConfig()
 
-		// Read remaining emails from file (includes both unprocessed and failed)
-		retryEmails, err := emailStorage.LoadEmailsFromFile(config.EmailsFilePath)
-		if err != nil || len(retryEmails) == 0 {
+		// Get failed emails from SQLite
+		failedEmails, err := emailStorage.GetEmailsByStatus(storage.StatusFailed)
+		if err != nil {
+			return fmt.Errorf("không thể lấy failed emails từ database: %w", err)
+		}
+
+		// Also get pending emails (unprocessed emails)
+		pendingEmails, err := emailStorage.GetPendingEmails()
+		if err != nil {
+			return fmt.Errorf("không thể lấy pending emails từ database: %w", err)
+		}
+
+		// Combine failed and pending emails for retry
+		var retryEmails []string
+		retryEmails = append(retryEmails, failedEmails...)
+		retryEmails = append(retryEmails, pendingEmails...)
+
+		if len(retryEmails) == 0 {
 			fmt.Println("✅ Không còn emails nào cần retry")
 			return nil
 		}
 
-		fmt.Printf("🔄 Phase 2 - Lần %d: Retry %d emails còn lại...\n", i, len(retryEmails))
+		fmt.Printf("🔄 Phase 2 - Lần %d: Retry %d emails (Failed: %d, Pending: %d)...\n",
+			i, len(retryEmails), len(failedEmails), len(pendingEmails))
+
+		// Show current stats
+		stats, err := emailStorage.GetEmailStats()
+		if err == nil {
+			fmt.Printf("📊 Stats hiện tại: Success: %d | Failed: %d | Pending: %d | HasInfo: %d | NoInfo: %d\n",
+				stats["success"], stats["failed"], stats["pending"], stats["has_info"], stats["no_info"])
+		}
+
 		fmt.Println("⏳ Chờ 10 giây trước khi retry...")
 		time.Sleep(10 * time.Second)
 
@@ -68,6 +93,16 @@ func (rh *RetryHandler) RetryFailedEmails() error {
 
 		fmt.Printf("🔄 Retry với %d tokens hợp lệ...\n", len(validTokens))
 
+		// Reset failed emails to pending status before retry
+		if len(failedEmails) > 0 {
+			fmt.Printf("🔄 Reset %d failed emails thành pending để retry...\n", len(failedEmails))
+			for _, email := range failedEmails {
+				if err := emailStorage.UpdateEmailStatus(email, storage.StatusPending, false, false); err != nil {
+					fmt.Printf("⚠️ Không thể reset status cho email %s: %v\n", email, err)
+				}
+			}
+		}
+
 		// Initialize crawler for retry
 		if err := batchProcessor.initializeCrawler(validTokens); err != nil {
 			return fmt.Errorf("failed to initialize crawler for retry: %w", err)
@@ -84,9 +119,20 @@ func (rh *RetryHandler) RetryFailedEmails() error {
 			rh.autoCrawler.SetCrawler(nil)
 		}
 
-		// Check after retry
-		emailsAfterList, _ := emailStorage.LoadEmailsFromFile(config.EmailsFilePath)
-		emailsAfter := len(emailsAfterList)
+		// Check progress after retry
+		pendingAfter, err := emailStorage.GetPendingEmails()
+		if err != nil {
+			fmt.Printf("⚠️ Không thể lấy pending emails sau retry: %v\n", err)
+			continue
+		}
+
+		failedAfter, err := emailStorage.GetEmailsByStatus(storage.StatusFailed)
+		if err != nil {
+			fmt.Printf("⚠️ Không thể lấy failed emails sau retry: %v\n", err)
+			continue
+		}
+
+		emailsAfter := len(pendingAfter) + len(failedAfter)
 
 		if emailsAfter == 0 {
 			fmt.Println("✅ Đã retry hết, không còn email nào cần retry nữa.")
@@ -98,7 +144,17 @@ func (rh *RetryHandler) RetryFailedEmails() error {
 			break
 		}
 
-		fmt.Printf("📊 Retry lần %d: %d -> %d emails còn lại\n", i, emailsBefore, emailsAfter)
+		fmt.Printf("📊 Retry lần %d: %d -> %d emails còn lại (Pending: %d, Failed: %d)\n",
+			i, emailsBefore, emailsAfter, len(pendingAfter), len(failedAfter))
+
+		// Show updated stats
+		statsAfter, err := emailStorage.GetEmailStats()
+		if err == nil {
+			fmt.Printf("📈 Stats sau retry: Success: %d | Failed: %d | Pending: %d | HasInfo: %d | NoInfo: %d\n",
+				statsAfter["success"], statsAfter["failed"], statsAfter["pending"],
+				statsAfter["has_info"], statsAfter["no_info"])
+		}
 	}
+
 	return nil
 }
