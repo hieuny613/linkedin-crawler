@@ -3,4 +3,4 @@ emails.txt
 crawler.log
 hit.txt
 accounts.txt
-emails.db
+emails.db*
