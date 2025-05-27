@@ -23,6 +23,7 @@ func (sm *StateManager) HasEmailsToProcess() bool {
 	pendingEmails, err := emailStorage.GetPendingEmails()
 	if err != nil {
 		fmt.Printf("⚠️ Không thể kiểm tra pending emails: %v\n", err)
+		// If database error, assume no emails to be safe
 		return false
 	}
 
@@ -60,10 +61,24 @@ func (sm *StateManager) SaveStateOnShutdown() {
 	emailStorage, _, _ := sm.autoCrawler.GetStorageServices()
 	config := sm.autoCrawler.GetConfig()
 
-	// Get current stats
+	fmt.Println("💾 Đang lưu trạng thái trước khi thoát...")
+
+	// Get current stats with error handling
 	stats, err := emailStorage.GetEmailStats()
 	if err != nil {
 		fmt.Printf("⚠️ Không thể lấy stats khi shutdown: %v\n", err)
+		// Try to export pending emails anyway
+		err = emailStorage.ExportPendingEmailsToFile(config.EmailsFilePath)
+		if err != nil {
+			fmt.Printf("⚠️ Không thể export pending emails khi shutdown: %v\n", err)
+		} else {
+			fmt.Printf("💾 Đã cố gắng export pending emails vào file emails.txt\n")
+		}
+
+		// Close database connection
+		if err := emailStorage.CloseDB(); err != nil {
+			fmt.Printf("⚠️ Lỗi khi đóng database: %v\n", err)
+		}
 		return
 	}
 
@@ -71,7 +86,6 @@ func (sm *StateManager) SaveStateOnShutdown() {
 	err = emailStorage.ExportPendingEmailsToFile(config.EmailsFilePath)
 	if err != nil {
 		fmt.Printf("⚠️ Không thể export pending emails khi shutdown: %v\n", err)
-		return
 	}
 
 	pendingCount := stats["pending"]
@@ -90,6 +104,8 @@ func (sm *StateManager) SaveStateOnShutdown() {
 	// Close database connection
 	if err := emailStorage.CloseDB(); err != nil {
 		fmt.Printf("⚠️ Lỗi khi đóng database: %v\n", err)
+	} else {
+		fmt.Println("✅ Đã đóng database connection")
 	}
 }
 
@@ -113,17 +129,33 @@ func (sm *StateManager) UpdateEmailsFile() {
 	fmt.Printf("💾 Đã cập nhật file emails: %d emails pending còn lại\n", len(pendingEmails))
 }
 
-// GetEmailStats returns current email statistics from SQLite
+// GetEmailStats returns current email statistics from SQLite with error handling
 func (sm *StateManager) GetEmailStats() (map[string]int, error) {
 	emailStorage, _, _ := sm.autoCrawler.GetStorageServices()
-	return emailStorage.GetEmailStats()
+
+	stats, err := emailStorage.GetEmailStats()
+	if err != nil {
+		// Return empty stats instead of nil to avoid panics
+		return map[string]int{
+			"pending":  0,
+			"success":  0,
+			"failed":   0,
+			"has_info": 0,
+			"no_info":  0,
+		}, err
+	}
+
+	return stats, nil
 }
 
-// PrintDetailedStats prints detailed statistics from SQLite
+// PrintDetailedStats prints detailed statistics from SQLite with error handling
 func (sm *StateManager) PrintDetailedStats() {
 	stats, err := sm.GetEmailStats()
 	if err != nil {
 		fmt.Printf("⚠️ Không thể lấy stats: %v\n", err)
+		// Show fallback info
+		fmt.Printf("📊 Chi tiết thống kê: Không khả dụng (database error)\n")
+		fmt.Printf("   📧 Tổng emails từ file: %d\n", len(sm.autoCrawler.GetTotalEmails()))
 		return
 	}
 

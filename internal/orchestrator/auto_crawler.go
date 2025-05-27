@@ -43,6 +43,9 @@ type AutoCrawler struct {
 	batchProcessor *BatchProcessor
 	retryHandler   *RetryHandler
 	stateManager   *StateManager
+
+	// Database cleanup flag
+	dbCleanupDone int32
 }
 
 // New creates a new AutoCrawler instance with SQLite integration
@@ -82,6 +85,7 @@ func New(config models.Config) (*AutoCrawler, error) {
 		logFile:          logFile,
 		logWriter:        bufio.NewWriter(logFile),
 		logChan:          make(chan string, 1000),
+		dbCleanupDone:    0,
 
 		// Initialize storage services
 		emailStorage:   emailStorage,
@@ -109,14 +113,30 @@ func New(config models.Config) (*AutoCrawler, error) {
 	}()
 
 	// Setup signal handling
-	utils.SetupSignalHandling(&ac.shutdownRequested, ac.stateManager.SaveStateOnShutdown, config.SleepDuration)
+	utils.SetupSignalHandling(&ac.shutdownRequested, ac.gracefulShutdown, config.SleepDuration)
 
 	return ac, nil
+}
+
+// gracefulShutdown handles graceful shutdown including database cleanup
+func (ac *AutoCrawler) gracefulShutdown() {
+	if atomic.SwapInt32(&ac.dbCleanupDone, 1) == 1 {
+		// Already cleaned up
+		return
+	}
+
+	fmt.Println("🔄 Thực hiện graceful shutdown...")
+
+	// Save state including exporting pending emails
+	ac.stateManager.SaveStateOnShutdown()
 }
 
 // Run starts the crawling process with SQLite integration
 func (ac *AutoCrawler) Run() error {
 	defer func() {
+		// Ensure cleanup on exit
+		ac.gracefulShutdown()
+
 		if atomic.LoadInt32(&ac.shutdownRequested) == 0 {
 			fmt.Printf("💤 Sleep %v trước khi thoát...\n", ac.config.SleepDuration)
 			time.Sleep(ac.config.SleepDuration)
@@ -138,9 +158,11 @@ func (ac *AutoCrawler) Run() error {
 		return err
 	}
 
-	// Phase 2 - Retry emails thất bại
-	if err := ac.retryHandler.RetryFailedEmails(); err != nil {
-		fmt.Printf("⚠️ Lỗi khi retry emails bị thất bại: %v\n", err)
+	// Phase 2 - Retry emails thất bại (only if not shutting down)
+	if atomic.LoadInt32(&ac.shutdownRequested) == 0 {
+		if err := ac.retryHandler.RetryFailedEmails(); err != nil {
+			fmt.Printf("⚠️ Lỗi khi retry emails bị thất bại: %v\n", err)
+		}
 	}
 
 	close(ac.logChan)
@@ -167,10 +189,17 @@ func (ac *AutoCrawler) printFinalResults() {
 	fmt.Println("🎉 HOÀN THÀNH AUTO LINKEDIN CRAWLER!")
 	fmt.Println(strings.Repeat("=", 80))
 
-	// Get final stats from SQLite
+	// Get final stats from SQLite (with error handling)
 	stats, err := ac.stateManager.GetEmailStats()
 	if err != nil {
 		fmt.Printf("⚠️ Không thể lấy stats cuối cùng: %v\n", err)
+
+		// Try to show alternative stats
+		totalOriginal := len(ac.totalEmails)
+		fmt.Printf("📈 TỔNG KẾT (LIMITED):\n")
+		fmt.Printf("   📊 Tổng emails ban đầu:   %d\n", totalOriginal)
+		fmt.Printf("   📁 Kết quả có thể xem trong file: %s\n", ac.outputFile)
+
 		return
 	}
 

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -34,6 +35,8 @@ type EmailStorage struct {
 	fileManager *FileManager
 	db          *sql.DB
 	dbPath      string
+	dbMutex     sync.RWMutex // Protect database access
+	isDBClosed  bool         // Track if DB is closed
 }
 
 // NewEmailStorage creates a new EmailStorage instance
@@ -41,11 +44,20 @@ func NewEmailStorage() *EmailStorage {
 	return &EmailStorage{
 		fileManager: NewFileManager(),
 		dbPath:      "emails.db",
+		isDBClosed:  false,
 	}
 }
 
 // InitDB initializes the SQLite database
 func (es *EmailStorage) InitDB() error {
+	es.dbMutex.Lock()
+	defer es.dbMutex.Unlock()
+
+	// If already initialized and not closed, return
+	if es.db != nil && !es.isDBClosed {
+		return nil
+	}
+
 	var err error
 	es.db, err = sql.Open("sqlite3", es.dbPath)
 	if err != nil {
@@ -56,6 +68,8 @@ func (es *EmailStorage) InitDB() error {
 	if err := es.db.Ping(); err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
+
+	es.isDBClosed = false
 
 	// Create table
 	createTableSQL := `
@@ -79,10 +93,27 @@ func (es *EmailStorage) InitDB() error {
 
 // CloseDB closes the database connection
 func (es *EmailStorage) CloseDB() error {
-	if es.db != nil {
+	es.dbMutex.Lock()
+	defer es.dbMutex.Unlock()
+
+	if es.db != nil && !es.isDBClosed {
+		es.isDBClosed = true
 		return es.db.Close()
 	}
 	return nil
+}
+
+// ensureDB ensures database connection is available
+func (es *EmailStorage) ensureDB() error {
+	es.dbMutex.RLock()
+	if es.db != nil && !es.isDBClosed {
+		es.dbMutex.RUnlock()
+		return nil
+	}
+	es.dbMutex.RUnlock()
+
+	// Need to initialize
+	return es.InitDB()
 }
 
 // isValidEmail validates email format
@@ -95,7 +126,7 @@ func (es *EmailStorage) isValidEmail(email string) bool {
 // LoadEmailsFromFile loads emails from file, validates them, and imports to SQLite
 func (es *EmailStorage) LoadEmailsFromFile(filePath string) ([]string, error) {
 	// Initialize database
-	if err := es.InitDB(); err != nil {
+	if err := es.ensureDB(); err != nil {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
 
@@ -116,13 +147,33 @@ func (es *EmailStorage) LoadEmailsFromFile(filePath string) ([]string, error) {
 		return nil, fmt.Errorf("failed to read emails file: %w", err)
 	}
 
+	es.dbMutex.Lock()
+	defer es.dbMutex.Unlock()
+
+	if es.isDBClosed {
+		return nil, fmt.Errorf("database is closed")
+	}
+
 	// Drop existing table and recreate
 	if _, err := es.db.Exec("DROP TABLE IF EXISTS emails"); err != nil {
 		return nil, fmt.Errorf("failed to drop table: %w", err)
 	}
 
-	if err := es.InitDB(); err != nil {
-		return nil, fmt.Errorf("failed to reinitialize database: %w", err)
+	// Recreate table
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS emails (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		email TEXT NOT NULL UNIQUE,
+		status TEXT NOT NULL DEFAULT 'pending',
+		has_info BOOLEAN DEFAULT FALSE,
+		no_info BOOLEAN DEFAULT FALSE
+	);
+	CREATE INDEX IF NOT EXISTS idx_email_status ON emails(status);
+	CREATE INDEX IF NOT EXISTS idx_email_email ON emails(email);
+	`
+
+	if _, err := es.db.Exec(createTableSQL); err != nil {
+		return nil, fmt.Errorf("failed to create table: %w", err)
 	}
 
 	var validEmails []string
@@ -179,15 +230,35 @@ func (es *EmailStorage) LoadEmailsFromFile(filePath string) ([]string, error) {
 	}
 
 	// Return pending emails
-	return es.GetPendingEmails()
+	rows, err := es.db.Query("SELECT email FROM emails WHERE status = ?", StatusPending)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pending emails: %w", err)
+	}
+	defer rows.Close()
+
+	var pendingEmails []string
+	for rows.Next() {
+		var email string
+		if err := rows.Scan(&email); err != nil {
+			return nil, fmt.Errorf("failed to scan email: %w", err)
+		}
+		pendingEmails = append(pendingEmails, email)
+	}
+
+	return pendingEmails, nil
 }
 
 // GetPendingEmails returns all emails with pending status
 func (es *EmailStorage) GetPendingEmails() ([]string, error) {
-	if es.db == nil {
-		if err := es.InitDB(); err != nil {
-			return nil, fmt.Errorf("failed to initialize database: %w", err)
-		}
+	if err := es.ensureDB(); err != nil {
+		return nil, fmt.Errorf("failed to ensure database: %w", err)
+	}
+
+	es.dbMutex.RLock()
+	defer es.dbMutex.RUnlock()
+
+	if es.isDBClosed {
+		return nil, fmt.Errorf("database is closed")
 	}
 
 	rows, err := es.db.Query("SELECT email FROM emails WHERE status = ?", StatusPending)
@@ -210,10 +281,15 @@ func (es *EmailStorage) GetPendingEmails() ([]string, error) {
 
 // UpdateEmailStatus updates the status of an email
 func (es *EmailStorage) UpdateEmailStatus(email string, status EmailStatus, hasInfo, noInfo bool) error {
-	if es.db == nil {
-		if err := es.InitDB(); err != nil {
-			return fmt.Errorf("failed to initialize database: %w", err)
-		}
+	if err := es.ensureDB(); err != nil {
+		return fmt.Errorf("failed to ensure database: %w", err)
+	}
+
+	es.dbMutex.RLock()
+	defer es.dbMutex.RUnlock()
+
+	if es.isDBClosed {
+		return fmt.Errorf("database is closed")
 	}
 
 	_, err := es.db.Exec(
@@ -229,12 +305,6 @@ func (es *EmailStorage) UpdateEmailStatus(email string, status EmailStatus, hasI
 
 // ExportPendingEmailsToFile exports pending emails back to file
 func (es *EmailStorage) ExportPendingEmailsToFile(filePath string) error {
-	if es.db == nil {
-		if err := es.InitDB(); err != nil {
-			return fmt.Errorf("failed to initialize database: %w", err)
-		}
-	}
-
 	pendingEmails, err := es.GetPendingEmails()
 	if err != nil {
 		return fmt.Errorf("failed to get pending emails: %w", err)
@@ -245,10 +315,15 @@ func (es *EmailStorage) ExportPendingEmailsToFile(filePath string) error {
 
 // GetEmailStats returns statistics about emails
 func (es *EmailStorage) GetEmailStats() (map[string]int, error) {
-	if es.db == nil {
-		if err := es.InitDB(); err != nil {
-			return nil, fmt.Errorf("failed to initialize database: %w", err)
-		}
+	if err := es.ensureDB(); err != nil {
+		return nil, fmt.Errorf("failed to ensure database: %w", err)
+	}
+
+	es.dbMutex.RLock()
+	defer es.dbMutex.RUnlock()
+
+	if es.isDBClosed {
+		return nil, fmt.Errorf("database is closed")
 	}
 
 	stats := make(map[string]int)
@@ -300,10 +375,15 @@ func (es *EmailStorage) GetEmailStats() (map[string]int, error) {
 
 // GetEmailsByStatus returns emails by status
 func (es *EmailStorage) GetEmailsByStatus(status EmailStatus) ([]string, error) {
-	if es.db == nil {
-		if err := es.InitDB(); err != nil {
-			return nil, fmt.Errorf("failed to initialize database: %w", err)
-		}
+	if err := es.ensureDB(); err != nil {
+		return nil, fmt.Errorf("failed to ensure database: %w", err)
+	}
+
+	es.dbMutex.RLock()
+	defer es.dbMutex.RUnlock()
+
+	if es.isDBClosed {
+		return nil, fmt.Errorf("database is closed")
 	}
 
 	rows, err := es.db.Query("SELECT email FROM emails WHERE status = ?", status)
