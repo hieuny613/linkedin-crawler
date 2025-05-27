@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -24,20 +25,11 @@ func NewEmailsTab(gui *CrawlerGUI) *EmailsTab {
 		emailData: binding.NewStringList(),
 	}
 
-	// Initialize form fields
-	tab.emailEntry = widget.NewEntry()
-	tab.emailEntry.SetPlaceHolder("user@example.com")
-
-	// Initialize buttons
-	tab.addBtn = widget.NewButtonWithIcon("Add Email", theme.ContentAddIcon(), tab.AddEmail)
-	tab.removeBtn = widget.NewButtonWithIcon("Remove Selected", theme.ContentRemoveIcon(), tab.RemoveEmail)
-	tab.importBtn = widget.NewButtonWithIcon("Import from File", theme.FolderOpenIcon(), tab.ImportEmails)
-	tab.exportBtn = widget.NewButtonWithIcon("Export to File", theme.DocumentSaveIcon(), tab.ExportEmails)
+	// Initialize buttons - only import and clear
+	tab.importBtn = widget.NewButtonWithIcon("Import", theme.FolderOpenIcon(), tab.ImportEmails)
 	tab.clearBtn = widget.NewButtonWithIcon("Clear All", theme.DeleteIcon(), tab.ClearAllEmails)
 
 	// Style buttons
-	tab.addBtn.Importance = widget.HighImportance
-	tab.removeBtn.Importance = widget.DangerImportance
 	tab.clearBtn.Importance = widget.DangerImportance
 
 	// Initialize stats labels
@@ -56,92 +48,46 @@ func NewEmailsTab(gui *CrawlerGUI) *EmailsTab {
 
 // CreateContent creates the emails tab content
 func (et *EmailsTab) CreateContent() fyne.CanvasObject {
-	// Add email form
-	addForm := &widget.Form{
-		Items: []*widget.FormItem{
-			{Text: "Email Address:", Widget: et.emailEntry, HintText: "Enter target email address"},
-		},
-	}
-
-	addCard := widget.NewCard("Add Target Email",
-		"Add email addresses to search for LinkedIn profiles", addForm)
-
-	// Add button container
-	addButtonContainer := container.NewHBox(
-		et.addBtn,
-		widget.NewButton("Clear", func() {
-			et.emailEntry.SetText("")
-		}),
-		widget.NewButton("Add Bulk", et.ShowBulkAddDialog),
+	// File operations buttons - only import, clear, refresh
+	fileButtons := container.NewHBox(
+		et.importBtn,
+		et.clearBtn,
+		widget.NewButton("Refresh", et.RefreshEmailsList),
 	)
 
-	// Bulk operations section
-	bulkOpsCard := widget.NewCard("Bulk Operations", "",
-		container.NewVBox(
-			widget.NewRichTextFromMarkdown("**Supported formats:** Plain emails or CSV with email column"),
-			container.NewHBox(et.importBtn, et.exportBtn),
-			container.NewHBox(et.clearBtn),
-		),
-	)
-
-	// Statistics section
-	statsGrid := container.NewGridWithColumns(2,
-		et.totalLabel, et.pendingLabel,
-		et.successLabel, et.failedLabel,
-		et.hasInfoLabel, et.noInfoLabel,
-	)
-
-	statsCard := widget.NewCard("Processing Statistics", "", statsGrid)
-
-	// Email validation info
-	validationCard := widget.NewCard("Email Validation", "",
-		widget.NewRichTextFromMarkdown(`
-**Valid Email Formats:**
-- user@domain.com
-- firstname.lastname@company.org
-- user+tag@domain.co.uk
-
-**Automatic Validation:**
-- Format checking with regex
-- Duplicate detection
-- Domain validation
-
-**Processing Status:**
-- **Pending:** Not yet processed
-- **Success:** Successfully processed (with or without LinkedIn data)
-- **Failed:** Failed after retries
-- **Has LinkedIn:** Found LinkedIn profile information
-- **No LinkedIn:** No LinkedIn profile found
-		`),
-	)
-
-	// Left panel
-	leftPanel := container.NewVBox(
-		addCard,
-		addButtonContainer,
+	// Statistics section - horizontal layout for compactness
+	statsRow1 := container.NewHBox(
+		et.totalLabel,
 		widget.NewSeparator(),
-		bulkOpsCard,
-		statsCard,
-		validationCard,
+		et.pendingLabel,
+		widget.NewSeparator(),
+		et.successLabel,
 	)
 
-	// Right panel with email list and controls
-	listHeader := container.NewHBox(
-		widget.NewLabel("Target Email Addresses"),
-		widget.NewButton("Refresh Stats", et.RefreshStats),
-		widget.NewButton("Refresh List", et.RefreshEmailsList),
-		et.removeBtn,
+	statsRow2 := container.NewHBox(
+		et.failedLabel,
+		widget.NewSeparator(),
+		et.hasInfoLabel,
+		widget.NewSeparator(),
+		et.noInfoLabel,
 	)
 
-	// Email list with status indicators
+	statsGrid := container.NewVBox(statsRow1, statsRow2)
+
+	// Left panel - more compact, no quick actions
+	leftPanel := container.NewVBox(
+		widget.NewCard("File Operations", "", fileButtons),
+		widget.NewCard("Statistics", "", statsGrid),
+	)
+
+	// Right panel with email list - no Add/Remove buttons, no title
 	rightPanel := container.NewVBox(
-		listHeader,
 		container.NewScroll(et.emailsList),
 	)
 
-	// Main layout
+	// Main layout - adjust split for better balance
 	content := container.NewHSplit(leftPanel, rightPanel)
-	content.SetOffset(0.4) // 40% for left, 60% for right
+	content.SetOffset(0.25) // 25% for left, 75% for right
 
 	return content
 }
@@ -154,12 +100,6 @@ func (et *EmailsTab) setupEmailsList() {
 			icon := widget.NewIcon(theme.MailSendIcon())
 			email := widget.NewLabel("Template")
 			status := widget.NewLabel("Status")
-
-			email.Wrapping = fyne.TextWrapWord
-			status.Wrapping = fyne.TextWrapWord
-
-			// Color code status
-			status.Importance = widget.MediumImportance
 
 			return container.NewHBox(
 				icon,
@@ -199,135 +139,12 @@ func (et *EmailsTab) setupEmailsList() {
 
 	et.emailsList.OnSelected = func(id widget.ListItemID) {
 		if id < len(et.emails) {
-			email := et.emails[id]
-			et.emailEntry.SetText(email)
+			et.selectedIndex = int(id)
 		}
 	}
 }
 
-// AddEmail adds a new email to the list
-func (et *EmailsTab) AddEmail() {
-	email := strings.TrimSpace(et.emailEntry.Text)
-
-	// Validate email
-	if !et.isValidEmail(email) {
-		dialog.ShowError(fmt.Errorf("Invalid email format: %s", email), et.gui.window)
-		return
-	}
-
-	// Check for duplicates
-	for _, existingEmail := range et.emails {
-		if existingEmail == email {
-			dialog.ShowError(fmt.Errorf("Email already exists: %s", email), et.gui.window)
-			return
-		}
-	}
-
-	// Add email
-	et.emails = append(et.emails, email)
-	et.emailData.Append(email)
-
-	// Clear form
-	et.emailEntry.SetText("")
-
-	// Update stats
-	et.updateStats()
-
-	et.gui.updateStatus(fmt.Sprintf("Added email: %s", email))
-}
-
-// RemoveEmail removes the selected email
-func (et *EmailsTab) RemoveEmail() {
-	id := et.selectedIndex
-	if id < 0 || id >= len(et.emails) {
-		dialog.ShowInformation("No Selection", "Please select an email to remove", et.gui.window)
-		return
-	}
-	email := et.emails[id]
-	dialog.ShowConfirm("Confirm Removal",
-		fmt.Sprintf("Are you sure you want to remove email: %s?", email),
-		func(confirmed bool) {
-			if confirmed {
-				et.emails = append(et.emails[:id], et.emails[id+1:]...)
-				et.emailData = binding.NewStringList()
-				for _, e := range et.emails {
-					et.emailData.Append(e)
-				}
-				et.emailsList.Refresh()
-				et.updateStats()
-				et.gui.updateStatus(fmt.Sprintf("Removed email: %s", email))
-			}
-		}, et.gui.window)
-}
-
-// ShowBulkAddDialog shows dialog for adding multiple emails
-func (et *EmailsTab) ShowBulkAddDialog() {
-	textArea := widget.NewMultiLineEntry()
-	textArea.SetPlaceHolder("Enter multiple emails, one per line:\n\nuser1@example.com\nuser2@company.org\nuser3@domain.net")
-	textArea.Resize(fyne.NewSize(400, 200))
-
-	dialog.ShowCustomConfirm("Add Multiple Emails", "Add", "Cancel",
-		container.NewVBox(
-			widget.NewLabel("Enter multiple email addresses (one per line):"),
-			textArea,
-		),
-		func(confirmed bool) {
-			if !confirmed {
-				return
-			}
-
-			lines := strings.Split(textArea.Text, "\n")
-			added := 0
-			var errors []string
-
-			for lineNum, line := range lines {
-				email := strings.TrimSpace(line)
-				if email == "" {
-					continue
-				}
-
-				// Handle CSV format (take last column as email)
-				if strings.Contains(email, ",") {
-					parts := strings.Split(email, ",")
-					email = strings.TrimSpace(parts[len(parts)-1])
-				}
-
-				if !et.isValidEmail(email) {
-					errors = append(errors, fmt.Sprintf("Line %d: Invalid email format: %s", lineNum+1, email))
-					continue
-				}
-
-				// Check for duplicates
-				exists := false
-				for _, existingEmail := range et.emails {
-					if existingEmail == email {
-						exists = true
-						break
-					}
-				}
-
-				if !exists {
-					et.emails = append(et.emails, email)
-					et.emailData.Append(email)
-					added++
-				}
-			}
-
-			// Update stats
-			et.updateStats()
-
-			// Show results
-			message := fmt.Sprintf("Added %d emails successfully", added)
-			if len(errors) > 0 {
-				message += fmt.Sprintf("\n\nErrors:\n%s", strings.Join(errors, "\n"))
-				dialog.ShowInformation("Import Results", message, et.gui.window)
-			} else {
-				et.gui.updateStatus(message)
-			}
-		}, et.gui.window)
-}
-
-// ImportEmails imports emails from a file
+// ImportEmails imports emails from a file - Fixed EOF error
 func (et *EmailsTab) ImportEmails() {
 	dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
 		if err != nil || reader == nil {
@@ -335,21 +152,24 @@ func (et *EmailsTab) ImportEmails() {
 		}
 		defer reader.Close()
 
-		// Read file content
-		data := make([]byte, 1024*1024) // 1MB limit
-		n, err := reader.Read(data)
-		if err != nil && n == 0 {
+		// Fixed: Use io.ReadAll for proper file reading
+		content, err := io.ReadAll(reader)
+		if err != nil {
 			dialog.ShowError(fmt.Errorf("Failed to read file: %v", err), et.gui.window)
 			return
 		}
 
-		content := string(data[:n])
-		lines := strings.Split(content, "\n")
+		// Handle empty files
+		if len(content) == 0 {
+			dialog.ShowInformation("Empty File", "The selected file is empty", et.gui.window)
+			return
+		}
 
+		lines := strings.Split(string(content), "\n")
 		imported := 0
-		var errors []string
+		skipped := 0
 
-		for lineNum, line := range lines {
+		for _, line := range lines {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "#") {
 				continue
@@ -360,7 +180,6 @@ func (et *EmailsTab) ImportEmails() {
 			// Handle CSV format
 			if strings.Contains(line, ",") {
 				parts := strings.Split(line, ",")
-				// Try to find email in any column
 				for _, part := range parts {
 					part = strings.TrimSpace(part)
 					if et.isValidEmail(part) {
@@ -371,7 +190,6 @@ func (et *EmailsTab) ImportEmails() {
 			}
 
 			if !et.isValidEmail(email) {
-				errors = append(errors, fmt.Sprintf("Line %d: Invalid email format: %s", lineNum+1, line))
 				continue
 			}
 
@@ -380,6 +198,7 @@ func (et *EmailsTab) ImportEmails() {
 			for _, existingEmail := range et.emails {
 				if existingEmail == email {
 					exists = true
+					skipped++
 					break
 				}
 			}
@@ -391,55 +210,11 @@ func (et *EmailsTab) ImportEmails() {
 			}
 		}
 
-		// Update stats
 		et.updateStats()
 
-		// Show results
-		message := fmt.Sprintf("Imported %d emails successfully", imported)
-		if len(errors) > 0 {
-			message += fmt.Sprintf("\n\nErrors:\n%s", strings.Join(errors, "\n"))
-			dialog.ShowInformation("Import Results", message, et.gui.window)
-		} else {
-			et.gui.updateStatus(message)
-		}
-
-	}, et.gui.window)
-}
-
-// ExportEmails exports emails to a file
-func (et *EmailsTab) ExportEmails() {
-	if len(et.emails) == 0 {
-		dialog.ShowInformation("No Data", "No emails to export", et.gui.window)
-		return
-	}
-
-	dialog.ShowFileSave(func(writer fyne.URIWriteCloser, err error) {
-		if err != nil || writer == nil {
-			return
-		}
-		defer writer.Close()
-
-		// Prepare content
-		var lines []string
-		lines = append(lines, "# Target Email Addresses")
-		lines = append(lines, "# Generated by LinkedIn Auto Crawler GUI")
-		lines = append(lines, "")
-
-		for _, email := range et.emails {
-			lines = append(lines, email)
-		}
-
-		content := strings.Join(lines, "\n")
-
-		// Write to file
-		_, err = writer.Write([]byte(content))
-		if err != nil {
-			dialog.ShowError(fmt.Errorf("Failed to write file: %v", err), et.gui.window)
-			return
-		}
-
-		et.gui.updateStatus(fmt.Sprintf("Exported %d emails to file", len(et.emails)))
-
+		message := fmt.Sprintf("Imported: %d | Skipped: %d", imported, skipped)
+		dialog.ShowInformation("Import Results", message, et.gui.window)
+		et.gui.updateStatus(fmt.Sprintf("Imported %d emails", imported))
 	}, et.gui.window)
 }
 
@@ -449,8 +224,8 @@ func (et *EmailsTab) ClearAllEmails() {
 		return
 	}
 
-	dialog.ShowConfirm("Confirm Clear All",
-		fmt.Sprintf("Are you sure you want to remove all %d emails?", len(et.emails)),
+	dialog.ShowConfirm("Clear All Emails",
+		fmt.Sprintf("Remove all %d emails?", len(et.emails)),
 		func(confirmed bool) {
 			if confirmed {
 				et.emails = []string{}
@@ -467,15 +242,13 @@ func (et *EmailsTab) LoadEmails() {
 	emailStorage := storageInternal.NewEmailStorage()
 	emails, err := emailStorage.LoadEmailsFromFile("emails.txt")
 	if err != nil {
-		// Create empty file if not exists
 		if _, err := os.Stat("emails.txt"); os.IsNotExist(err) {
-			sampleContent := `# Target email addresses for LinkedIn profile search
-# One email per line
+			sampleContent := `# Target email addresses
 example@example.com
 `
 			os.WriteFile("emails.txt", []byte(sampleContent), 0644)
 		}
-		et.gui.updateStatus("No emails file found, created sample file")
+		et.gui.updateStatus("No emails file found")
 		return
 	}
 
@@ -491,7 +264,7 @@ example@example.com
 	}
 
 	et.updateStats()
-	et.gui.updateStatus(fmt.Sprintf("Loaded %d emails from file", len(emails)))
+	et.gui.updateStatus(fmt.Sprintf("Loaded %d emails", len(emails)))
 }
 
 // SaveEmails saves emails to the default emails.txt file
@@ -502,8 +275,7 @@ func (et *EmailsTab) SaveEmails() {
 
 	// Prepare content
 	var lines []string
-	lines = append(lines, "# Target email addresses for LinkedIn profile search")
-	lines = append(lines, "# Generated by LinkedIn Auto Crawler GUI")
+	lines = append(lines, "# Target email addresses")
 	lines = append(lines, "")
 
 	for _, email := range et.emails {
@@ -515,22 +287,16 @@ func (et *EmailsTab) SaveEmails() {
 	// Write to file
 	err := os.WriteFile("emails.txt", []byte(content), 0644)
 	if err != nil {
-		et.gui.updateStatus(fmt.Sprintf("Failed to save emails: %v", err))
+		et.gui.updateStatus(fmt.Sprintf("Failed to save: %v", err))
 		return
 	}
 
-	et.gui.updateStatus(fmt.Sprintf("Saved %d emails to file", len(et.emails)))
+	et.gui.updateStatus(fmt.Sprintf("Saved %d emails", len(et.emails)))
 }
 
 // RefreshEmailsList refreshes the emails list display
 func (et *EmailsTab) RefreshEmailsList() {
 	et.LoadEmails()
-}
-
-// RefreshStats refreshes statistics from database
-func (et *EmailsTab) RefreshStats() {
-	et.updateStats()
-	et.gui.updateStatus("Statistics refreshed")
 }
 
 // isValidEmail validates email format
@@ -545,8 +311,6 @@ func (et *EmailsTab) getEmailStatus(email string) string {
 	if et.gui.autoCrawler != nil {
 		emailStorage, _, _ := et.gui.autoCrawler.GetStorageServices()
 		if emailStorage != nil {
-			// This would require adding a method to get individual email status
-			// For now, return pending as default
 			return "Pending"
 		}
 	}

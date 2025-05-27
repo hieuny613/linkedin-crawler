@@ -19,18 +19,19 @@ func NewLogsTab(gui *CrawlerGUI) *LogsTab {
 	tab := &LogsTab{
 		gui:       gui,
 		logBuffer: []string{},
-		maxLogs:   1000,
+		maxLogs:   500,
 	}
 
 	// Initialize controls
-	tab.clearBtn = widget.NewButtonWithIcon("Clear Logs", theme.DeleteIcon(), tab.ClearLogs)
-	tab.saveBtn = widget.NewButtonWithIcon("Save Logs", theme.DocumentSaveIcon(), tab.SaveLogs)
+	tab.clearBtn = widget.NewButtonWithIcon("Clear", theme.DeleteIcon(), tab.ClearLogs)
+	tab.saveBtn = widget.NewButtonWithIcon("Save", theme.DocumentSaveIcon(), tab.SaveLogs)
 	tab.autoScroll = widget.NewCheck("Auto-scroll", nil)
 	tab.autoScroll.SetChecked(true)
 
 	// Initialize log levels
 	tab.levelSelect = widget.NewSelect([]string{"All", "Info", "Warning", "Error"}, nil)
 	tab.levelSelect.SetSelected("All")
+	tab.levelSelect.OnChanged = func(string) { tab.updateLogDisplay() }
 
 	// Initialize log display
 	tab.logText = widget.NewRichText()
@@ -45,10 +46,8 @@ func (lt *LogsTab) CreateContent() fyne.CanvasObject {
 	controls := container.NewHBox(
 		lt.clearBtn,
 		lt.saveBtn,
-		widget.NewSeparator(),
 		widget.NewLabel("Level:"),
 		lt.levelSelect,
-		widget.NewSeparator(),
 		lt.autoScroll,
 	)
 
@@ -83,13 +82,13 @@ func (lt *LogsTab) AddLog(message string) {
 
 // ClearLogs clears all logs
 func (lt *LogsTab) ClearLogs() {
-	dialog.ShowConfirm("Confirm Clear",
-		"Are you sure you want to clear all logs?",
+	dialog.ShowConfirm("Clear Logs",
+		"Clear all logs?",
 		func(confirmed bool) {
 			if confirmed {
 				lt.logBuffer = []string{}
 				lt.updateLogDisplay()
-				lt.gui.updateStatus("Cleared all logs")
+				lt.gui.updateStatus("Logs cleared")
 			}
 		}, lt.gui.window)
 }
@@ -117,7 +116,7 @@ func (lt *LogsTab) SaveLogs() {
 
 		_, err = writer.Write([]byte(content))
 		if err != nil {
-			dialog.ShowError(fmt.Errorf("Failed to write file: %v", err), lt.gui.window)
+			dialog.ShowError(err, lt.gui.window)
 			return
 		}
 
@@ -192,8 +191,8 @@ func (lt *LogsTab) updateLogDisplay() {
 		displayText.WriteString("No logs match the selected filter\n")
 	} else {
 		startIdx := 0
-		if len(filteredLogs) > 100 {
-			startIdx = len(filteredLogs) - 100
+		if len(filteredLogs) > 50 {
+			startIdx = len(filteredLogs) - 50
 		}
 		for i := startIdx; i < len(filteredLogs); i++ {
 			displayText.WriteString(filteredLogs[i])
@@ -205,7 +204,6 @@ func (lt *LogsTab) updateLogDisplay() {
 	lt.logText.ParseMarkdown(displayText.String())
 }
 
-// Optional: GetLogs for export or other use
 func (lt *LogsTab) GetLogs() []string {
 	return lt.logBuffer
 }

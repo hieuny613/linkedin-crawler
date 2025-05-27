@@ -20,16 +20,12 @@ func NewControlTab(gui *CrawlerGUI) *ControlTab {
 	}
 
 	// Initialize buttons
-	tab.startBtn = widget.NewButtonWithIcon("Start Crawler", theme.MediaPlayIcon(), tab.StartCrawler)
-	tab.stopBtn = widget.NewButtonWithIcon("Stop Crawler", theme.MediaStopIcon(), tab.StopCrawler)
-	tab.pauseBtn = widget.NewButtonWithIcon("Pause", theme.MediaPauseIcon(), tab.PauseCrawler)
-	tab.resumeBtn = widget.NewButtonWithIcon("Resume", theme.MediaPlayIcon(), tab.ResumeCrawler)
+	tab.startBtn = widget.NewButtonWithIcon("Start", theme.MediaPlayIcon(), tab.StartCrawler)
+	tab.stopBtn = widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), tab.StopCrawler)
 
 	// Style buttons
 	tab.startBtn.Importance = widget.HighImportance
 	tab.stopBtn.Importance = widget.DangerImportance
-	tab.pauseBtn.Importance = widget.MediumImportance
-	tab.resumeBtn.Importance = widget.HighImportance
 
 	// Initialize progress
 	tab.progressBar = widget.NewProgressBar()
@@ -54,63 +50,62 @@ func NewControlTab(gui *CrawlerGUI) *ControlTab {
 
 // CreateContent creates the control tab content
 func (ct *ControlTab) CreateContent() fyne.CanvasObject {
-	// Control buttons section
+	// Control buttons section with better spacing
 	controlButtons := container.NewHBox(
 		ct.startBtn,
+		widget.NewSeparator(),
 		ct.stopBtn,
-		ct.pauseBtn,
-		ct.resumeBtn,
 	)
 
-	controlCard := widget.NewCard("Crawler Control",
-		"Start, stop, pause, and resume the crawling process",
-		container.NewVBox(controlButtons))
+	controlCard := widget.NewCard("Control", "",
+		container.NewVBox(
+			controlButtons,
+			widget.NewSeparator(),
+		))
 
-	// Progress section
+	// Progress section with better spacing
 	progressContent := container.NewVBox(
 		ct.progressLabel,
 		ct.progressBar,
+		widget.NewSeparator(),
 		container.NewHBox(ct.statusLabel, ct.timeLabel),
 	)
 
-	progressCard := widget.NewCard("Progress",
-		"Real-time crawling progress and status", progressContent)
+	progressCard := widget.NewCard("Progress", "", progressContent)
 
-	// Statistics section
-	statsGrid := container.NewGridWithColumns(2,
-		ct.processedLabel, ct.successLabel,
-		ct.failedLabel, ct.tokensLabel,
-		ct.rateLabel, widget.NewLabel(""),
+	// Statistics section with better spacing
+	statsGrid := container.NewVBox(
+		ct.processedLabel,
+		widget.NewSeparator(),
+		ct.successLabel,
+		ct.failedLabel,
+		widget.NewSeparator(),
+		ct.tokensLabel,
+		ct.rateLabel,
 	)
 
-	statsCard := widget.NewCard("Real-time Statistics",
-		"Live crawler performance metrics", statsGrid)
+	statsCard := widget.NewCard("Statistics", "", statsGrid)
 
 	// Performance monitoring
 	performanceCard := ct.createPerformanceCard()
 
-	// Configuration summary
-	configCard := ct.createConfigSummaryCard()
-
-	// Recent activity preview
+	// Recent activity
 	activityCard := ct.createActivityCard()
 
-	// Control tips and help
-	helpCard := ct.createHelpCard()
-
-	// Left column
+	// Left column with better spacing
 	leftColumn := container.NewVBox(
 		controlCard,
+		widget.NewSeparator(),
 		progressCard,
+		widget.NewSeparator(),
 		statsCard,
 	)
 
-	// Right column
+	// Right column with better spacing
 	rightColumn := container.NewVBox(
 		performanceCard,
-		configCard,
+		widget.NewSeparator(),
 		activityCard,
-		helpCard,
 	)
 
 	// Main layout
@@ -122,171 +117,66 @@ func (ct *ControlTab) CreateContent() fyne.CanvasObject {
 
 // createPerformanceCard creates the performance monitoring card
 func (ct *ControlTab) createPerformanceCard() *widget.Card {
-	cpuLabel := widget.NewLabel("CPU: Monitoring...")
 	memoryLabel := widget.NewLabel("Memory: 0 MB")
 	goroutinesLabel := widget.NewLabel("Goroutines: 0")
-	connectionsLabel := widget.NewLabel("Connections: Idle")
+	connectionsLabel := widget.NewLabel("Status: Idle")
 
-	// Start performance monitoring
+	// Không dùng go func! Sử dụng time.Ticker trong main thread bằng callback Update UI.
+	updateFunc := func() {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		memoryMB := m.Alloc / 1024 / 1024
+		memoryLabel.SetText(fmt.Sprintf("Memory: %d MB", memoryMB))
+
+		// Update goroutines
+		numGoroutines := runtime.NumGoroutine()
+		goroutinesLabel.SetText(fmt.Sprintf("Goroutines: %d", numGoroutines))
+
+		// Update connection status
+		if ct.gui.isRunning {
+			connectionsLabel.SetText("Status: Running")
+		} else {
+			connectionsLabel.SetText("Status: Idle")
+		}
+	}
+	// Tạo ticker bằng time.NewTicker, nhưng **callback gọi updateFunc trực tiếp từ main thread**:
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
-
 		for {
 			select {
 			case <-ticker.C:
-				// Update memory stats
-				var m runtime.MemStats
-				runtime.ReadMemStats(&m)
-				memoryMB := m.Alloc / 1024 / 1024
-				memoryLabel.SetText(fmt.Sprintf("Memory: %d MB", memoryMB))
-
-				// Update goroutines
-				numGoroutines := runtime.NumGoroutine()
-				goroutinesLabel.SetText(fmt.Sprintf("Goroutines: %d", numGoroutines))
-
-				// Update connection status
-				if ct.gui.isRunning {
-					connectionsLabel.SetText("Connections: Active")
-				} else {
-					connectionsLabel.SetText("Connections: Idle")
-				}
-
-				// Update CPU (simplified - would need proper CPU monitoring)
-				if ct.gui.isRunning {
-					cpuLabel.SetText("CPU: Active")
-				} else {
-					cpuLabel.SetText("CPU: Idle")
-				}
-
+				// Thực thi updateFunc trên main thread bằng cách gọi qua channel
+				fyne.CurrentApp().SendNotification(&fyne.Notification{
+					Title:   "",
+					Content: "",
+				}) // Đánh thức main event loop, không update UI ở đây!
+				ct.gui.updateUI <- updateFunc
 			case <-ct.gui.ctx.Done():
 				return
 			}
 		}
 	}()
+	// Gọi lần đầu ngay khi khởi tạo
+	updateFunc()
 
 	performanceGrid := container.NewVBox(
-		cpuLabel,
 		memoryLabel,
 		goroutinesLabel,
 		connectionsLabel,
 	)
 
-	return widget.NewCard("Performance Monitor",
-		"System resource usage and crawler health", performanceGrid)
-}
-
-// createConfigSummaryCard creates the configuration summary card
-func (ct *ControlTab) createConfigSummaryCard() *widget.Card {
-	// This will be updated dynamically
-	summaryLabel := widget.NewRichText()
-
-	// Update function
-	updateSummary := func() {
-		config := ct.gui.configTab.config
-		accountCount := len(ct.gui.accountsTab.accounts)
-		emailCount := len(ct.gui.emailsTab.emails)
-
-		summary := fmt.Sprintf(`**Current Configuration:**
-
-**Performance:**
-- Max Concurrency: %d
-- Requests/Second: %.1f
-- Request Timeout: %s
-
-**Token Management:**
-- Min Tokens: %d
-- Max Tokens: %d
-
-**Data:**
-- Accounts: %d
-- Target Emails: %d
-
-**Status:** %s`,
-			config.MaxConcurrency,
-			config.RequestsPerSec,
-			config.RequestTimeout,
-			config.MinTokens,
-			config.MaxTokens,
-			accountCount,
-			emailCount,
-			ct.getRunningStatus(),
-		)
-
-		summaryLabel.ParseMarkdown(summary)
-	}
-
-	// Initial update
-	updateSummary()
-
-	// Update periodically
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				updateSummary()
-			case <-ct.gui.ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return widget.NewCard("Configuration Summary",
-		"Active crawler settings and data", summaryLabel)
+	return widget.NewCard("Performance", "", performanceGrid)
 }
 
 // createActivityCard creates the recent activity card
 func (ct *ControlTab) createActivityCard() *widget.Card {
 	activityText := widget.NewRichText()
-	activityText.ParseMarkdown("*No recent activity*\n\nStart the crawler to see real-time activity updates.")
+	activityText.ParseMarkdown("*Ready to start crawling*")
 
-	// This would be updated with actual crawler activity
 	ct.activityText = activityText
 
-	return widget.NewCard("Recent Activity",
-		"Last few crawler operations", activityText)
-}
-
-// createHelpCard creates the help and tips card
-func (ct *ControlTab) createHelpCard() *widget.Card {
-	helpInfo := widget.NewRichTextFromMarkdown(`
-### 🎮 Control Guide
-
-**Start Crawler:**
-- Validates configuration and accounts
-- Initializes token extraction
-- Begins email processing
-
-**Stop Crawler:**
-- Graceful shutdown with state saving
-- Exports pending emails
-- Preserves partial results
-
-**Monitor Progress:**
-- Real-time statistics updates
-- Performance metrics tracking
-- Error and success counting
-
-### 📊 Understanding Metrics
-
-**Processed:** Total emails handled
-**Success:** Emails successfully processed
-**Failed:** Emails that failed after retries
-**Rate:** Current processing speed
-**Tokens:** Available authentication tokens
-
-### 💡 Tips
-
-- Monitor memory usage during large batches
-- Watch for rate limiting (429 errors)
-- Check token count regularly
-- Save configuration before starting
-	`)
-
-	return widget.NewCard("Control Help", "", helpInfo)
+	return widget.NewCard("Activity", "", activityText)
 }
 
 // StartCrawler starts the crawling process
@@ -299,20 +189,6 @@ func (ct *ControlTab) StopCrawler() {
 	ct.gui.stopCrawler()
 }
 
-// PauseCrawler pauses the crawling process
-func (ct *ControlTab) PauseCrawler() {
-	// Note: Pause functionality would need to be implemented in the crawler core
-	ct.gui.updateStatus("Pause functionality coming soon")
-	ct.gui.logsTab.AddLog("⏸️ Pause requested (feature coming soon)")
-}
-
-// ResumeCrawler resumes the crawling process
-func (ct *ControlTab) ResumeCrawler() {
-	// Note: Resume functionality would need to be implemented in the crawler core
-	ct.gui.updateStatus("Resume functionality coming soon")
-	ct.gui.logsTab.AddLog("▶️ Resume requested (feature coming soon)")
-}
-
 // OnCrawlerStarted updates UI when crawler starts
 func (ct *ControlTab) OnCrawlerStarted() {
 	ct.updateButtonStates(true)
@@ -323,13 +199,13 @@ func (ct *ControlTab) OnCrawlerStarted() {
 
 	// Reset progress
 	ct.progressBar.SetValue(0)
-	ct.progressLabel.SetText("Initializing crawler...")
+	ct.progressLabel.SetText("Initializing...")
 
 	// Start progress updates
 	ct.startProgressUpdates()
 
 	// Update activity
-	ct.updateActivity("🚀 Crawler started successfully")
+	ct.updateActivity("🚀 Crawler started")
 }
 
 // OnCrawlerStopped updates UI when crawler stops
@@ -357,13 +233,9 @@ func (ct *ControlTab) updateButtonStates(running bool) {
 	if running {
 		ct.startBtn.Disable()
 		ct.stopBtn.Enable()
-		ct.pauseBtn.Enable()
-		ct.resumeBtn.Disable()
 	} else {
 		ct.startBtn.Enable()
 		ct.stopBtn.Disable()
-		ct.pauseBtn.Disable()
-		ct.resumeBtn.Disable()
 	}
 }
 
@@ -372,16 +244,15 @@ func (ct *ControlTab) startProgressUpdates() {
 	if ct.updateTicker != nil {
 		ct.updateTicker.Stop()
 	}
-
-	ct.updateTicker = time.NewTicker(1 * time.Second)
-
+	ct.updateTicker = time.NewTicker(2 * time.Second)
 	go func() {
 		defer ct.updateTicker.Stop()
-
 		for {
 			select {
 			case <-ct.updateTicker.C:
-				ct.updateProgress()
+				ct.gui.updateUI <- func() {
+					ct.updateProgress()
+				}
 			case <-ct.gui.ctx.Done():
 				return
 			}
@@ -444,14 +315,6 @@ func (ct *ControlTab) updateProgress() {
 				if elapsed.Seconds() > 0 {
 					rate := float64(processed) / elapsed.Seconds()
 					ct.rateLabel.SetText(fmt.Sprintf("Rate: %.2f emails/s", rate))
-
-					// Estimate completion time
-					if rate > 0 && ct.totalEmails > processed {
-						remaining := ct.totalEmails - processed
-						estimatedSeconds := float64(remaining) / rate
-						estimatedDuration := time.Duration(estimatedSeconds) * time.Second
-						ct.updateActivity(fmt.Sprintf("📊 ETA: %s", ct.formatDuration(estimatedDuration)))
-					}
 				}
 			}
 		}
@@ -476,7 +339,7 @@ func (ct *ControlTab) updateProgress() {
 				ct.updateActivity("⚠️ All tokens failed - extracting new tokens")
 			} else {
 				activeRequests := atomic.LoadInt32(&crawlerInstance.ActiveRequests)
-				ct.statusLabel.SetText(fmt.Sprintf("Status: Running (%d active requests)", activeRequests))
+				ct.statusLabel.SetText(fmt.Sprintf("Status: Running (%d active)", activeRequests))
 
 				// Update activity based on token status
 				if validTokens < 3 {
@@ -493,16 +356,16 @@ func (ct *ControlTab) updateActivity(message string) {
 		timestamp := time.Now().Format("15:04:05")
 		activity := fmt.Sprintf("[%s] %s", timestamp, message)
 
-		// Keep only recent activities (last 10)
+		// Keep only recent activities (last 5)
 		currentText := ct.activityText.String()
 		lines := strings.Split(currentText, "\n")
 
 		// Add new activity
 		lines = append(lines, activity)
 
-		// Keep only last 10 lines
-		if len(lines) > 10 {
-			lines = lines[len(lines)-10:]
+		// Keep only last 5 lines
+		if len(lines) > 5 {
+			lines = lines[len(lines)-5:]
 		}
 
 		newText := "**Recent Activity:**\n\n" + strings.Join(lines, "\n")
@@ -523,139 +386,4 @@ func (ct *ControlTab) formatDuration(d time.Duration) string {
 		minutes := int(d.Minutes()) % 60
 		return fmt.Sprintf("%dh%dm", hours, minutes)
 	}
-}
-
-// getRunningStatus returns the current running status as string
-func (ct *ControlTab) getRunningStatus() string {
-	if ct.gui.isRunning {
-		return "Running"
-	}
-	return "Stopped"
-}
-
-// Additional helper methods for the control tab
-
-// GetCurrentStats returns current crawler statistics
-func (ct *ControlTab) GetCurrentStats() map[string]interface{} {
-	stats := make(map[string]interface{})
-
-	stats["running"] = ct.gui.isRunning
-	stats["total_emails"] = ct.totalEmails
-	stats["processed_emails"] = ct.processedEmails
-
-	if !ct.startTime.IsZero() {
-		stats["elapsed_time"] = time.Since(ct.startTime).Seconds()
-	}
-
-	// Get detailed stats from crawler if available
-	ct.gui.crawlerMux.RLock()
-	crawler := ct.gui.autoCrawler
-	ct.gui.crawlerMux.RUnlock()
-
-	if crawler != nil {
-		emailStorage, _, _ := crawler.GetStorageServices()
-		if emailStorage != nil {
-			if dbStats, err := emailStorage.GetEmailStats(); err == nil {
-				for key, value := range dbStats {
-					stats[key] = value
-				}
-			}
-		}
-
-		crawlerInstance := crawler.GetCrawler()
-		if crawlerInstance != nil {
-			stats["total_tokens"] = len(crawlerInstance.Tokens)
-
-			validTokens := 0
-			for _, token := range crawlerInstance.Tokens {
-				if !crawlerInstance.InvalidTokens[token] {
-					validTokens++
-				}
-			}
-			stats["valid_tokens"] = validTokens
-			stats["active_requests"] = atomic.LoadInt32(&crawlerInstance.ActiveRequests)
-		}
-	}
-
-	return stats
-}
-
-// Emergency stop function for critical situations
-func (ct *ControlTab) EmergencyStop() {
-	ct.gui.logsTab.AddLog("🆘 Emergency stop initiated")
-	ct.StopCrawler()
-
-	// Force cleanup if normal stop doesn't work
-	go func() {
-		time.Sleep(5 * time.Second)
-		if ct.gui.isRunning {
-			ct.gui.logsTab.AddLog("🔴 Force stopping crawler...")
-			ct.gui.cleanup()
-		}
-	}()
-}
-
-// Export current session statistics
-func (ct *ControlTab) ExportSessionStats() {
-	stats := ct.GetCurrentStats()
-
-	// Create stats report
-	report := fmt.Sprintf(`# Crawler Session Statistics
-Generated: %s
-
-## Session Info
-- Status: %s
-- Start Time: %s
-- Duration: %s
-
-## Processing Stats
-- Total Emails: %v
-- Processed: %v
-- Success: %v
-- Failed: %v
-- Has LinkedIn Info: %v
-- No LinkedIn Info: %v
-
-## Performance
-- Processing Rate: %.2f emails/second
-- Valid Tokens: %v/%v
-- Active Requests: %v
-
-## System Resources
-- Memory Usage: %d MB
-- Goroutines: %d
-`,
-		time.Now().Format("2006-01-02 15:04:05"),
-		ct.getRunningStatus(),
-		ct.startTime.Format("15:04:05"),
-		ct.formatDuration(time.Since(ct.startTime)),
-		stats["total_emails"],
-		stats["processed_emails"],
-		stats["success"],
-		stats["failed"],
-		stats["has_info"],
-		stats["no_info"],
-		func() float64 {
-			if elapsed := time.Since(ct.startTime).Seconds(); elapsed > 0 {
-				return float64(ct.processedEmails) / elapsed
-			}
-			return 0.0
-		}(),
-		stats["valid_tokens"],
-		stats["total_tokens"],
-		stats["active_requests"],
-		func() uint64 {
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-			return m.Alloc / 1024 / 1024
-		}(),
-		runtime.NumGoroutine(),
-	)
-
-	// Chỉ cần thêm 1 dòng như sau để không lỗi:
-	ct.gui.logsTab.AddLog(report)
-	// Hoặc hiển thị dialog
-	// dialog.ShowInformation("Session Stats", report, ct.gui.window)
-
-	ct.gui.updateStatus("Session statistics exported")
 }

@@ -45,6 +45,7 @@ type CrawlerGUI struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	statusLabel *widget.Label
+	updateUI    chan func()
 }
 
 func main() {
@@ -67,11 +68,6 @@ func main() {
 	gui.setupUI()
 	gui.loadSettings()
 
-	// Add welcome message
-	gui.logsTab.AddLog("🚀 LinkedIn Auto Crawler GUI started")
-	gui.logsTab.AddLog("📋 Use the tabs to configure accounts, emails, and crawler settings")
-	gui.logsTab.AddLog("▶️ Go to the Control tab to start crawling")
-
 	// Run the application
 	gui.window.ShowAndRun()
 }
@@ -81,9 +77,9 @@ func NewCrawlerGUI() *CrawlerGUI {
 	a := app.NewWithID("com.linkedin.crawler.gui")
 	a.SetIcon(theme.ComputerIcon())
 
-	w := a.NewWindow("LinkedIn Auto Crawler - GUI Version")
-	w.Resize(fyne.NewSize(1400, 900))
-	w.SetMaster()
+	w := a.NewWindow("LinkedIn Auto Crawler")
+	w.Resize(fyne.NewSize(1000, 600)) // Smaller fixed size
+	w.SetFixedSize(true)              // Fixed size
 	w.CenterOnScreen()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -103,6 +99,7 @@ func NewCrawlerGUI() *CrawlerGUI {
 	gui.controlTab = NewControlTab(gui)
 	gui.resultsTab = NewResultsTab(gui)
 	gui.logsTab = NewLogsTab(gui)
+	gui.updateUI = make(chan func(), 100)
 
 	return gui
 }
@@ -111,22 +108,21 @@ func NewCrawlerGUI() *CrawlerGUI {
 func (gui *CrawlerGUI) setupUI() {
 	// Create main tabs
 	tabs := container.NewAppTabs(
-		container.NewTabItem("⚙️ Configuration", gui.configTab.CreateContent()),
-		container.NewTabItem("👥 Accounts", gui.accountsTab.CreateContent()),
-		container.NewTabItem("📧 Emails", gui.emailsTab.CreateContent()),
-		container.NewTabItem("🎮 Control", gui.controlTab.CreateContent()),
-		container.NewTabItem("📊 Results", gui.resultsTab.CreateContent()),
-		container.NewTabItem("📝 Logs", gui.logsTab.CreateContent()),
+		container.NewTabItem("Config", gui.configTab.CreateContent()),
+		container.NewTabItem("Accounts", gui.accountsTab.CreateContent()),
+		container.NewTabItem("Emails", gui.emailsTab.CreateContent()),
+		container.NewTabItem("Control", gui.controlTab.CreateContent()),
+		container.NewTabItem("Results", gui.resultsTab.CreateContent()),
+		container.NewTabItem("Logs", gui.logsTab.CreateContent()),
 	)
 
-	// Status bar
-	gui.statusBar = widget.NewLabel("Ready - LinkedIn Auto Crawler GUI")
-	gui.statusBar.Wrapping = fyne.TextWrapWord
+	// Compact status bar
+	gui.statusBar = widget.NewLabel("Ready")
 
 	// Memory info
 	memoryLabel := widget.NewLabel("")
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 
 		for {
@@ -134,24 +130,17 @@ func (gui *CrawlerGUI) setupUI() {
 			case <-ticker.C:
 				var m runtime.MemStats
 				runtime.ReadMemStats(&m)
-				memoryLabel.SetText(fmt.Sprintf("Memory: %d MB | Goroutines: %d",
-					m.Alloc/1024/1024, runtime.NumGoroutine()))
+				memoryLabel.SetText(fmt.Sprintf("%d MB", m.Alloc/1024/1024))
 			case <-gui.ctx.Done():
 				return
 			}
 		}
 	}()
 
-	// Bottom status container with app info
-	appInfo := widget.NewLabel("LinkedIn Auto Crawler v2.0 - GUI Edition")
-	appInfo.TextStyle.Italic = true
-
+	// Simple status container
 	statusContainer := container.NewBorder(
 		nil, nil,
-		container.NewVBox(
-			widget.NewLabel("Status:"),
-			appInfo,
-		),
+		widget.NewLabel("Status:"),
 		memoryLabel,
 		gui.statusBar,
 	)
@@ -168,7 +157,7 @@ func (gui *CrawlerGUI) setupUI() {
 	gui.window.SetCloseIntercept(func() {
 		if gui.isRunning {
 			dialog.ShowConfirm("Confirm Exit",
-				"Crawler is running. Do you want to stop it and exit?",
+				"Crawler is running. Stop and exit?",
 				func(confirmed bool) {
 					if confirmed {
 						gui.stopCrawler()
@@ -185,17 +174,10 @@ func (gui *CrawlerGUI) setupUI() {
 
 // loadSettings loads saved settings
 func (gui *CrawlerGUI) loadSettings() {
-	// Load configuration
 	gui.configTab.LoadConfig()
-
-	// Load accounts
 	gui.accountsTab.LoadAccounts()
-
-	// Load emails
 	gui.emailsTab.LoadEmails()
-
-	// Update status
-	gui.updateStatus("Settings loaded successfully")
+	gui.updateStatus("Ready")
 }
 
 // saveSettings saves current settings
@@ -216,12 +198,12 @@ func (gui *CrawlerGUI) startCrawler() {
 
 	// Validate configuration
 	if len(gui.accountsTab.accounts) == 0 {
-		dialog.ShowError(fmt.Errorf("No Microsoft Teams accounts configured.\nPlease add accounts in the Accounts tab."), gui.window)
+		dialog.ShowError(fmt.Errorf("No accounts configured"), gui.window)
 		return
 	}
 
 	if len(gui.emailsTab.emails) == 0 {
-		dialog.ShowError(fmt.Errorf("No target emails configured.\nPlease add emails in the Emails tab."), gui.window)
+		dialog.ShowError(fmt.Errorf("No emails configured"), gui.window)
 		return
 	}
 
@@ -229,7 +211,7 @@ func (gui *CrawlerGUI) startCrawler() {
 	gui.saveSettings()
 
 	// Show starting dialog
-	progressDialog := dialog.NewProgressInfinite("Starting Crawler", "Initializing crawler components...", gui.window)
+	progressDialog := dialog.NewProgressInfinite("Starting...", "Initializing...", gui.window)
 	progressDialog.Show()
 
 	// Initialize crawler in goroutine
@@ -239,7 +221,7 @@ func (gui *CrawlerGUI) startCrawler() {
 		cfg := gui.configTab.config
 		autoCrawler, err := orchestrator.New(cfg)
 		if err != nil {
-			dialog.ShowError(fmt.Errorf("Failed to initialize crawler: %v", err), gui.window)
+			dialog.ShowError(fmt.Errorf("Failed to initialize: %v", err), gui.window)
 			return
 		}
 
@@ -248,9 +230,7 @@ func (gui *CrawlerGUI) startCrawler() {
 
 		// Update UI
 		gui.controlTab.OnCrawlerStarted()
-		gui.updateStatus("Crawler started successfully")
-		gui.logsTab.AddLog("🚀 Crawler initialization completed")
-		gui.logsTab.AddLog(fmt.Sprintf("📊 Processing %d emails with %d accounts", len(gui.emailsTab.emails), len(gui.accountsTab.accounts)))
+		gui.updateStatus("Running...")
 
 		// Start crawler
 		err = autoCrawler.Run()
@@ -264,21 +244,15 @@ func (gui *CrawlerGUI) startCrawler() {
 		gui.controlTab.OnCrawlerStopped()
 
 		if err != nil {
-			gui.logsTab.AddLog(fmt.Sprintf("❌ Crawler finished with error: %v", err))
-			gui.updateStatus("Crawler stopped with errors")
+			gui.updateStatus("Stopped with errors")
 		} else {
-			gui.logsTab.AddLog("✅ Crawler finished successfully")
-			gui.updateStatus("Crawler completed successfully")
-
-			// Auto-refresh results
+			gui.updateStatus("Completed successfully")
 			gui.resultsTab.RefreshResults()
 		}
 
 		// Show completion notification
 		if gui.window != nil {
-			dialog.ShowInformation("Crawler Finished",
-				"The crawling process has completed. Check the Results tab for findings.",
-				gui.window)
+			dialog.ShowInformation("Complete", "Crawling finished", gui.window)
 		}
 	}()
 }
@@ -298,8 +272,7 @@ func (gui *CrawlerGUI) stopCrawler() {
 		*shutdownRequested = 1
 	}
 
-	gui.updateStatus("Stopping crawler...")
-	gui.logsTab.AddLog("⏹️ Stop signal sent to crawler")
+	gui.updateStatus("Stopping...")
 }
 
 // cleanup performs cleanup when exiting
@@ -311,14 +284,11 @@ func (gui *CrawlerGUI) cleanup() {
 	}
 
 	gui.saveSettings()
-	gui.logsTab.AddLog("🔄 Application cleanup completed")
 }
 
 // updateStatus updates the status bar
 func (gui *CrawlerGUI) updateStatus(status string) {
-	if gui.statusLabel != nil {
-		gui.statusLabel.SetText(status)
-	} else {
-		fmt.Println("[Status]", status) // hoặc ghi log ra terminal tạm thời
+	if gui.statusBar != nil {
+		gui.statusBar.SetText(status)
 	}
 }
