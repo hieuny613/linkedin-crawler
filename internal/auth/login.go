@@ -25,7 +25,7 @@ func NewLoginService() *LoginService {
 
 // LoginToTeams performs login to Microsoft Teams
 func (ls *LoginService) LoginToTeams(ctx context.Context, account models.Account) (string, error) {
-	loginURL := "https://teams.microsoft.com/"
+	loginURL := "https://m365.cloud.microsoft/search/?auth=2&home=1"
 
 	fmt.Printf("🔑 Đang xử lý account: %s\n", account.Email)
 	var lokiToken string
@@ -66,18 +66,6 @@ func (ls *LoginService) LoginToTeams(ctx context.Context, account models.Account
 		}),
 
 		chromedp.Sleep(10*time.Second),
-
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			return ls.browserManager.ClickChatButton(ctx)
-		}),
-
-		chromedp.Sleep(5*time.Second),
-
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			return ls.browserManager.ClickChatConversation(ctx)
-		}),
-
-		chromedp.Sleep(5*time.Second),
 		chromedp.Evaluate(`sessionStorage.getItem("LokiAuthToken")`, &lokiToken),
 	)
 	if err != nil {

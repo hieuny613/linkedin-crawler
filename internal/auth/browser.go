@@ -21,7 +21,7 @@ func NewBrowserManager() *BrowserManager {
 // CreateBrowserContext creates and configures a Chrome browser context
 func (bm *BrowserManager) CreateBrowserContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", false),
+		chromedp.Flag("headless", true),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 		chromedp.Flag("disable-infobars", true),
 		chromedp.Flag("no-sandbox", true),

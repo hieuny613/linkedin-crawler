@@ -5,7 +5,6 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/widget"
 
 	"linkedin-crawler/internal/models"
@@ -29,59 +28,6 @@ type ConfigTab struct {
 
 	// Current config
 	config models.Config
-}
-
-// AccountsTab handles Microsoft Teams accounts management
-type AccountsTab struct {
-	gui *CrawlerGUI
-
-	// Account list
-	accountsList *widget.List
-	accounts     []models.Account
-	accountData  binding.StringList
-
-	// Form for adding accounts
-	emailEntry    *widget.Entry
-	passwordEntry *widget.Entry
-	addBtn        *widget.Button
-	removeBtn     *widget.Button
-	importBtn     *widget.Button
-	exportBtn     *widget.Button
-
-	// Stats
-	totalLabel     *widget.Label
-	usedLabel      *widget.Label
-	remainingLabel *widget.Label
-
-	selectedIndex int
-}
-
-// EmailsTab handles target emails management
-type EmailsTab struct {
-	gui *CrawlerGUI
-
-	// Email list
-	emailsList *widget.List
-	emails     []string
-	emailData  binding.StringList
-
-	// Form for adding emails
-	emailEntry *widget.Entry
-	addBtn     *widget.Button
-	removeBtn  *widget.Button
-	importBtn  *widget.Button
-	exportBtn  *widget.Button
-	clearBtn   *widget.Button
-
-	// Stats
-	totalLabel   *widget.Label
-	pendingLabel *widget.Label
-	successLabel *widget.Label
-	failedLabel  *widget.Label
-	hasInfoLabel *widget.Label
-	noInfoLabel  *widget.Label
-
-	selectedIndex int
 }
 
 // ControlTab handles crawler execution control

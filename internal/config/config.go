@@ -9,8 +9,8 @@ import (
 // DefaultConfig returns the default configuration for the crawler
 func DefaultConfig() models.Config {
 	return models.Config{
-		MaxConcurrency:   100,
-		RequestsPerSec:   30.0,
+		MaxConcurrency:   30,
+		RequestsPerSec:   15.0,
 		RequestTimeout:   15 * time.Second,
 		ShutdownTimeout:  10 * time.Second,
 		EmailsFilePath:   "emails.txt",
