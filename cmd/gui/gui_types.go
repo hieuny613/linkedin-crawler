@@ -81,9 +81,18 @@ type ResultsTab struct {
 	exportBtn   *widget.Button
 	clearBtn    *widget.Button
 	filterEntry *widget.Entry
+	statsCard   *widget.Card
+	infoCard    *widget.Card
 
 	// Stats summary
-	summaryCard *widget.Card
+	summaryCard     *widget.Card
+	refreshTicker   *time.Ticker
+	originalResults []CrawlerResult
+
+	autoRefreshCheck *widget.Check
+	autoRefresh      bool
+	sortSelect       *widget.Select
+	statusFilter     *widget.Select
 }
 
 // LogsTab shows real-time logs
@@ -305,16 +314,16 @@ var (
 
 // Icon constants (would be loaded from resources)
 var (
-	IconStart    fyne.Resource
-	IconStop     fyne.Resource
-	IconPause    fyne.Resource
-	IconResume   fyne.Resource
-	IconRefresh  fyne.Resource
+	IconStart  fyne.Resource
+	IconStop   fyne.Resource
+	IconPause  fyne.Resource
+	IconResume fyne.Resource
+	// IconRefresh  fyne.Resource
 	IconExport   fyne.Resource
 	IconImport   fyne.Resource
 	IconSettings fyne.Resource
-	IconAccount  fyne.Resource
-	IconEmail    fyne.Resource
+	// IconAccount  fyne.Resource
+	// IconEmail    fyne.Resource
 	IconLinkedIn fyne.Resource
 )
 

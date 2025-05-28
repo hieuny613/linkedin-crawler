@@ -32,6 +32,7 @@ type CrawlerGUI struct {
 	accountsTab *AccountsTab
 	emailsTab   *EmailsTab
 	resultsTab  *ResultsTab
+	controlTab  *ControlTab
 
 	statusBar *widget.Label
 

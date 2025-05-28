@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -48,7 +49,7 @@ func NewEmailStorage() *EmailStorage {
 	}
 }
 
-// InitDB initializes the SQLite database
+// InitDB initializes the SQLite database and DROPS existing table
 func (es *EmailStorage) InitDB() error {
 	es.dbMutex.Lock()
 	defer es.dbMutex.Unlock()
@@ -71,23 +72,33 @@ func (es *EmailStorage) InitDB() error {
 
 	es.isDBClosed = false
 
-	// Create table
+	// IMPORTANT: Drop existing table first to start fresh
+	if _, err := es.db.Exec("DROP TABLE IF EXISTS emails"); err != nil {
+		return fmt.Errorf("failed to drop existing emails table: %w", err)
+	}
+
+	// Create fresh table
 	createTableSQL := `
 	CREATE TABLE IF NOT EXISTS emails (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		email TEXT NOT NULL UNIQUE,
 		status TEXT NOT NULL DEFAULT 'pending',
 		has_info BOOLEAN DEFAULT FALSE,
-		no_info BOOLEAN DEFAULT FALSE
+		no_info BOOLEAN DEFAULT FALSE,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE INDEX IF NOT EXISTS idx_email_status ON emails(status);
 	CREATE INDEX IF NOT EXISTS idx_email_email ON emails(email);
+	CREATE INDEX IF NOT EXISTS idx_email_has_info ON emails(has_info);
+	CREATE INDEX IF NOT EXISTS idx_email_no_info ON emails(no_info);
 	`
 
 	if _, err := es.db.Exec(createTableSQL); err != nil {
-		return fmt.Errorf("failed to create table: %w", err)
+		return fmt.Errorf("failed to create emails table: %w", err)
 	}
 
+	fmt.Println("✅ Database initialized: Dropped old emails table and created fresh one")
 	return nil
 }
 
@@ -124,8 +135,9 @@ func (es *EmailStorage) isValidEmail(email string) bool {
 }
 
 // LoadEmailsFromFile loads emails from file, validates them, and imports to SQLite
+// ALWAYS drops and recreates table for fresh start
 func (es *EmailStorage) LoadEmailsFromFile(filePath string) ([]string, error) {
-	// Initialize database
+	// Initialize database (this will drop existing table)
 	if err := es.ensureDB(); err != nil {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
@@ -136,8 +148,13 @@ func (es *EmailStorage) LoadEmailsFromFile(filePath string) ([]string, error) {
 	}
 
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		fmt.Printf("Emails file not found at %s, creating empty file\n", filePath)
-		if err := os.WriteFile(filePath, []byte("example@example.com\n"), 0644); err != nil {
+		fmt.Printf("Emails file not found at %s, creating sample file\n", filePath)
+		sampleContent := `# Target email addresses
+# One email per line
+example@example.com
+test@test.com
+`
+		if err := os.WriteFile(filePath, []byte(sampleContent), 0644); err != nil {
 			return nil, fmt.Errorf("failed to create emails file: %w", err)
 		}
 	}
@@ -154,56 +171,61 @@ func (es *EmailStorage) LoadEmailsFromFile(filePath string) ([]string, error) {
 		return nil, fmt.Errorf("database is closed")
 	}
 
-	// Drop existing table and recreate
-	if _, err := es.db.Exec("DROP TABLE IF EXISTS emails"); err != nil {
-		return nil, fmt.Errorf("failed to drop table: %w", err)
-	}
-
-	// Recreate table
-	createTableSQL := `
-	CREATE TABLE IF NOT EXISTS emails (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		email TEXT NOT NULL UNIQUE,
-		status TEXT NOT NULL DEFAULT 'pending',
-		has_info BOOLEAN DEFAULT FALSE,
-		no_info BOOLEAN DEFAULT FALSE
-	);
-	CREATE INDEX IF NOT EXISTS idx_email_status ON emails(status);
-	CREATE INDEX IF NOT EXISTS idx_email_email ON emails(email);
-	`
-
-	if _, err := es.db.Exec(createTableSQL); err != nil {
-		return nil, fmt.Errorf("failed to create table: %w", err)
-	}
-
+	// Parse and validate emails
 	var validEmails []string
 	var invalidEmails []string
 
-	for _, line := range lines {
+	for lineNum, line := range lines {
 		line = strings.TrimSpace(line)
-		email := line
 
-		if strings.Contains(line, ",") {
-			parts := strings.SplitN(line, ",", 2)
-			email = strings.TrimSpace(parts[1])
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
 
-		if email != "" && !strings.HasPrefix(email, "#") {
+		email := line
+
+		// Handle CSV format (take first valid email from comma-separated values)
+		if strings.Contains(line, ",") {
+			parts := strings.SplitN(line, ",", 2)
+			email = strings.TrimSpace(parts[0])
+		}
+
+		if email != "" {
 			if es.isValidEmail(email) {
 				validEmails = append(validEmails, email)
 			} else {
 				invalidEmails = append(invalidEmails, email)
-				fmt.Printf("⚠️ Email không hợp lệ, bỏ qua: %s\n", email)
+				fmt.Printf("⚠️ Line %d - Invalid email format, skipped: %s\n", lineNum+1, email)
 			}
 		}
 	}
 
 	if len(invalidEmails) > 0 {
-		fmt.Printf("🗑️ Đã bỏ qua %d emails không hợp lệ\n", len(invalidEmails))
+		fmt.Printf("🗑️ Skipped %d invalid emails\n", len(invalidEmails))
 	}
 
-	// Import valid emails to database
-	if len(validEmails) > 0 {
+	// Remove duplicates
+	emailMap := make(map[string]bool)
+	uniqueEmails := []string{}
+	duplicates := 0
+
+	for _, email := range validEmails {
+		email = strings.ToLower(email) // Normalize to lowercase
+		if !emailMap[email] {
+			emailMap[email] = true
+			uniqueEmails = append(uniqueEmails, email)
+		} else {
+			duplicates++
+		}
+	}
+
+	if duplicates > 0 {
+		fmt.Printf("🔄 Removed %d duplicate emails\n", duplicates)
+	}
+
+	// Import unique valid emails to database
+	if len(uniqueEmails) > 0 {
 		tx, err := es.db.Begin()
 		if err != nil {
 			return nil, fmt.Errorf("failed to begin transaction: %w", err)
@@ -216,9 +238,17 @@ func (es *EmailStorage) LoadEmailsFromFile(filePath string) ([]string, error) {
 		}
 		defer stmt.Close()
 
-		for _, email := range validEmails {
-			if _, err := stmt.Exec(email, StatusPending); err != nil {
-				fmt.Printf("⚠️ Không thể thêm email %s: %v\n", email, err)
+		inserted := 0
+		for _, email := range uniqueEmails {
+			result, err := stmt.Exec(email, StatusPending)
+			if err != nil {
+				fmt.Printf("⚠️ Failed to insert email %s: %v\n", email, err)
+				continue
+			}
+
+			// Check if actually inserted (not ignored due to duplicate)
+			if rowsAffected, _ := result.RowsAffected(); rowsAffected > 0 {
+				inserted++
 			}
 		}
 
@@ -226,11 +256,11 @@ func (es *EmailStorage) LoadEmailsFromFile(filePath string) ([]string, error) {
 			return nil, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 
-		fmt.Printf("✅ Đã import %d emails hợp lệ vào database\n", len(validEmails))
+		fmt.Printf("✅ Imported %d unique emails to database\n", inserted)
 	}
 
-	// Return pending emails
-	rows, err := es.db.Query("SELECT email FROM emails WHERE status = ?", StatusPending)
+	// Return all pending emails from database
+	rows, err := es.db.Query("SELECT email FROM emails WHERE status = ? ORDER BY id", StatusPending)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query pending emails: %w", err)
 	}
@@ -245,6 +275,7 @@ func (es *EmailStorage) LoadEmailsFromFile(filePath string) ([]string, error) {
 		pendingEmails = append(pendingEmails, email)
 	}
 
+	fmt.Printf("📊 Database summary: %d pending emails ready for processing\n", len(pendingEmails))
 	return pendingEmails, nil
 }
 
@@ -261,7 +292,7 @@ func (es *EmailStorage) GetPendingEmails() ([]string, error) {
 		return nil, fmt.Errorf("database is closed")
 	}
 
-	rows, err := es.db.Query("SELECT email FROM emails WHERE status = ?", StatusPending)
+	rows, err := es.db.Query("SELECT email FROM emails WHERE status = ? ORDER BY id", StatusPending)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query pending emails: %w", err)
 	}
@@ -293,7 +324,7 @@ func (es *EmailStorage) UpdateEmailStatus(email string, status EmailStatus, hasI
 	}
 
 	_, err := es.db.Exec(
-		"UPDATE emails SET status = ?, has_info = ?, no_info = ? WHERE email = ?",
+		"UPDATE emails SET status = ?, has_info = ?, no_info = ?, updated_at = CURRENT_TIMESTAMP WHERE email = ?",
 		status, hasInfo, noInfo, email,
 	)
 	if err != nil {
@@ -310,7 +341,17 @@ func (es *EmailStorage) ExportPendingEmailsToFile(filePath string) error {
 		return fmt.Errorf("failed to get pending emails: %w", err)
 	}
 
-	return es.fileManager.WriteLines(filePath, pendingEmails)
+	// Add header comment
+	var lines []string
+	lines = append(lines, "# Pending emails for LinkedIn crawler")
+	lines = append(lines, fmt.Sprintf("# Exported on: %s", strings.Split(fmt.Sprintf("%v", time.Now()), " ")[0]))
+	lines = append(lines, fmt.Sprintf("# Total pending: %d", len(pendingEmails)))
+	lines = append(lines, "")
+
+	// Add emails
+	lines = append(lines, pendingEmails...)
+
+	return es.fileManager.WriteLines(filePath, lines)
 }
 
 // GetEmailStats returns statistics about emails
@@ -386,7 +427,7 @@ func (es *EmailStorage) GetEmailsByStatus(status EmailStatus) ([]string, error) 
 		return nil, fmt.Errorf("database is closed")
 	}
 
-	rows, err := es.db.Query("SELECT email FROM emails WHERE status = ?", status)
+	rows, err := es.db.Query("SELECT email FROM emails WHERE status = ? ORDER BY id", status)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query emails by status: %w", err)
 	}
@@ -402,6 +443,79 @@ func (es *EmailStorage) GetEmailsByStatus(status EmailStatus) ([]string, error) 
 	}
 
 	return emails, nil
+}
+
+// GetDatabaseInfo returns information about the database
+func (es *EmailStorage) GetDatabaseInfo() (map[string]interface{}, error) {
+	if err := es.ensureDB(); err != nil {
+		return nil, fmt.Errorf("failed to ensure database: %w", err)
+	}
+
+	es.dbMutex.RLock()
+	defer es.dbMutex.RUnlock()
+
+	if es.isDBClosed {
+		return nil, fmt.Errorf("database is closed")
+	}
+
+	info := make(map[string]interface{})
+
+	// Get total count
+	var totalCount int
+	err := es.db.QueryRow("SELECT COUNT(*) FROM emails").Scan(&totalCount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get total count: %w", err)
+	}
+	info["total_emails"] = totalCount
+
+	// Get database file size
+	if stat, err := os.Stat(es.dbPath); err == nil {
+		info["db_file_size"] = stat.Size()
+	}
+
+	info["db_path"] = es.dbPath
+	info["is_closed"] = es.isDBClosed
+
+	return info, nil
+}
+
+// ResetDatabase drops and recreates the emails table (for testing/reset purposes)
+func (es *EmailStorage) ResetDatabase() error {
+	es.dbMutex.Lock()
+	defer es.dbMutex.Unlock()
+
+	if es.db == nil || es.isDBClosed {
+		return fmt.Errorf("database is not initialized or closed")
+	}
+
+	// Drop existing table
+	if _, err := es.db.Exec("DROP TABLE IF EXISTS emails"); err != nil {
+		return fmt.Errorf("failed to drop emails table: %w", err)
+	}
+
+	// Create fresh table
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS emails (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		email TEXT NOT NULL UNIQUE,
+		status TEXT NOT NULL DEFAULT 'pending',
+		has_info BOOLEAN DEFAULT FALSE,
+		no_info BOOLEAN DEFAULT FALSE,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE INDEX IF NOT EXISTS idx_email_status ON emails(status);
+	CREATE INDEX IF NOT EXISTS idx_email_email ON emails(email);
+	CREATE INDEX IF NOT EXISTS idx_email_has_info ON emails(has_info);
+	CREATE INDEX IF NOT EXISTS idx_email_no_info ON emails(no_info);
+	`
+
+	if _, err := es.db.Exec(createTableSQL); err != nil {
+		return fmt.Errorf("failed to recreate emails table: %w", err)
+	}
+
+	fmt.Println("✅ Database reset: Emails table dropped and recreated")
+	return nil
 }
 
 // WriteEmailsToFile writes emails to a file in a thread-safe manner (legacy compatibility)
