@@ -63,7 +63,9 @@ type ControlTab struct {
 	totalEmails     int
 	processedEmails int
 
-	activityText *widget.RichText
+	// Activity log
+	activityText   *widget.RichText
+	activityBuffer []string // NEW: Buffer for activity history
 }
 
 // ResultsTab shows crawling results

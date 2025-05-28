@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -15,6 +17,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"linkedin-crawler/internal/auth"
 	"linkedin-crawler/internal/models"
 	storageInternal "linkedin-crawler/internal/storage"
 )
@@ -38,13 +41,19 @@ type AccountsTab struct {
 	logBuffer []string
 
 	selectedIndex int
+
+	// Token extraction state
+	isTokenExtracting  int32 // atomic flag
+	tokenExtractCancel context.CancelFunc
+	tokenExtractor     *auth.TokenExtractor
 }
 
 func NewAccountsTab(gui *CrawlerGUI) *AccountsTab {
 	tab := &AccountsTab{
-		gui:         gui,
-		accounts:    []models.Account{},
-		accountData: binding.NewStringList(),
+		gui:            gui,
+		accounts:       []models.Account{},
+		accountData:    binding.NewStringList(),
+		tokenExtractor: auth.NewTokenExtractor(),
 	}
 
 	tab.importBtn = widget.NewButtonWithIcon("Import", theme.FolderOpenIcon(), tab.ImportAccounts)
@@ -54,6 +63,7 @@ func NewAccountsTab(gui *CrawlerGUI) *AccountsTab {
 	tab.startTokenBtn = widget.NewButtonWithIcon("Start Token Extract", theme.MediaPlayIcon(), tab.StartTokenExtract)
 	tab.stopTokenBtn = widget.NewButtonWithIcon("Stop Token Extract", theme.MediaStopIcon(), tab.StopTokenExtract)
 	tab.stopTokenBtn.Importance = widget.DangerImportance
+	tab.stopTokenBtn.Disable() // Initially disabled
 
 	tab.logText = widget.NewRichText()
 	tab.logText.Wrapping = fyne.TextWrapWord
@@ -73,6 +83,7 @@ func (at *AccountsTab) CreateContent() fyne.CanvasObject {
 		at.cleanBtn,
 		widget.NewButton("Refresh", at.RefreshAccountsList),
 	)
+
 	statsGrid := container.NewHBox(
 		at.totalLabel,
 		widget.NewSeparator(),
@@ -80,27 +91,42 @@ func (at *AccountsTab) CreateContent() fyne.CanvasObject {
 		widget.NewSeparator(),
 		at.remainingLabel,
 	)
+
 	actionsButtons := container.NewHBox(
 		widget.NewButton("Validate All", at.ValidateAllAccounts),
 		widget.NewButton("Remove Failed", at.RemoveFailedAccounts),
 		widget.NewButton("Export Valid", at.ExportValidAccounts),
 	)
+
 	leftPanel := container.NewVBox(
 		widget.NewCard("File Operations", "", fileButtons),
 		widget.NewCard("Statistics", "", statsGrid),
 		widget.NewCard("Quick Actions", "", actionsButtons),
 		container.NewScroll(at.accountsList),
 	)
-	controlCard := widget.NewCard("Token Control", "", container.NewVBox(
+
+	// Control buttons
+	controlButtons := container.NewVBox(
 		at.startTokenBtn,
 		at.stopTokenBtn,
-		widget.NewSeparator(),
-		widget.NewLabel("Log:"),
-		container.NewVScroll(at.logText),
-	))
-	controlCard.Resize(fyne.NewSize(350, 420))
-	content := container.NewHSplit(leftPanel, controlCard)
-	content.SetOffset(0.6)
+	)
+
+	// Log area - MỞ RỘNG XUỐNG DƯỚI
+	logScroll := container.NewScroll(at.logText)
+	logArea := container.NewBorder(
+		widget.NewLabel("Token Extraction Log:"), nil, nil, nil,
+		logScroll,
+	)
+
+	// Right panel with expanded log area
+	rightPanel := container.NewBorder(
+		widget.NewCard("Token Control", "", controlButtons),
+		nil, nil, nil,
+		widget.NewCard("Logs", "", logArea), // Log area chiếm phần lớn không gian
+	)
+
+	content := container.NewHSplit(leftPanel, rightPanel)
+	content.SetOffset(0.5) // 50-50 split
 	return content
 }
 
@@ -145,14 +171,162 @@ func (at *AccountsTab) setupAccountsList() {
 	at.selectedIndex = -1
 }
 
+// START TOKEN EXTRACT - Hoạt động thực tế
 func (at *AccountsTab) StartTokenExtract() {
-	at.addLog("Bắt đầu lấy token...")
-	// TODO: Viết code thực hiện lấy token ở đây.
+	// Check if already running
+	if atomic.LoadInt32(&at.isTokenExtracting) == 1 {
+		at.addLog("⚠️ Token extraction đã đang chạy!")
+		return
+	}
+
+	// Check if there are accounts
+	if len(at.accounts) == 0 {
+		at.addLog("❌ Không có accounts để extract tokens!")
+		dialog.ShowError(fmt.Errorf("Không có accounts để extract tokens"), at.gui.window)
+		return
+	}
+
+	// Set running state
+	atomic.StoreInt32(&at.isTokenExtracting, 1)
+	at.startTokenBtn.Disable()
+	at.stopTokenBtn.Enable()
+
+	at.addLog("🚀 Bắt đầu extract tokens từ accounts...")
+	at.addLog(fmt.Sprintf("📊 Tổng số accounts: %d", len(at.accounts)))
+
+	// Create context for cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	at.tokenExtractCancel = cancel
+
+	// Run extraction in background
+	go func() {
+		defer func() {
+			// Reset state when done
+			atomic.StoreInt32(&at.isTokenExtracting, 0)
+			at.gui.updateUI <- func() {
+				at.startTokenBtn.Enable()
+				at.stopTokenBtn.Disable()
+				at.addLog("✅ Token extraction hoàn thành!")
+			}
+		}()
+
+		at.performTokenExtraction(ctx)
+	}()
 }
+
+// STOP TOKEN EXTRACT - Hoạt động thực tế
 func (at *AccountsTab) StopTokenExtract() {
-	at.addLog("Dừng lấy token!")
-	// TODO: Viết code dừng lấy token ở đây.
+	if atomic.LoadInt32(&at.isTokenExtracting) == 0 {
+		at.addLog("⚠️ Token extraction không đang chạy!")
+		return
+	}
+
+	at.addLog("⏹️ Đang dừng token extraction...")
+
+	// Cancel the context
+	if at.tokenExtractCancel != nil {
+		at.tokenExtractCancel()
+	}
+
+	// Reset state immediately
+	atomic.StoreInt32(&at.isTokenExtracting, 0)
+	at.startTokenBtn.Enable()
+	at.stopTokenBtn.Disable()
+
+	at.addLog("🛑 Đã dừng token extraction!")
 }
+
+// performTokenExtraction thực hiện việc extract tokens
+func (at *AccountsTab) performTokenExtraction(ctx context.Context) {
+	successCount := 0
+	failCount := 0
+
+	// Process accounts in batches of 3
+	batchSize := 3
+	for i := 0; i < len(at.accounts); i += batchSize {
+		// Check if cancelled
+		select {
+		case <-ctx.Done():
+			at.gui.updateUI <- func() {
+				at.addLog("⚠️ Token extraction bị hủy bởi người dùng")
+			}
+			return
+		default:
+		}
+
+		end := i + batchSize
+		if end > len(at.accounts) {
+			end = len(at.accounts)
+		}
+
+		batch := at.accounts[i:end]
+		at.gui.updateUI <- func() {
+			at.addLog(fmt.Sprintf("📦 Xử lý batch %d-%d (%d accounts)...", i+1, end, len(batch)))
+		}
+
+		// Extract tokens from batch
+		results := at.tokenExtractor.ExtractTokensBatch(batch, "accounts.txt")
+
+		var validTokens []string
+		for _, result := range results {
+			if result.Error != nil {
+				failCount++
+				at.gui.updateUI <- func() {
+					at.addLog(fmt.Sprintf("❌ Lỗi account %s: %v", result.Account.Email, result.Error))
+				}
+			} else if result.Token != "" {
+				successCount++
+				validTokens = append(validTokens, result.Token)
+				at.gui.updateUI <- func() {
+					at.addLog(fmt.Sprintf("✅ Thành công account %s", result.Account.Email))
+				}
+			}
+		}
+
+		// Save tokens to file
+		if len(validTokens) > 0 {
+			tokenStorage := storageInternal.NewTokenStorage()
+			err := tokenStorage.SaveTokensToFile("tokens.txt", validTokens)
+			if err != nil {
+				at.gui.updateUI <- func() {
+					at.addLog(fmt.Sprintf("⚠️ Lỗi lưu tokens: %v", err))
+				}
+			} else {
+				at.gui.updateUI <- func() {
+					at.addLog(fmt.Sprintf("💾 Đã lưu %d tokens vào file", len(validTokens)))
+				}
+			}
+		}
+
+		// Update progress
+		at.gui.updateUI <- func() {
+			at.addLog(fmt.Sprintf("📊 Tiến độ: %d/%d accounts | Success: %d | Fail: %d",
+				end, len(at.accounts), successCount, failCount))
+		}
+
+		// Rest between batches (except last batch)
+		if end < len(at.accounts) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+				// Continue to next batch
+			}
+		}
+	}
+
+	// Final summary
+	at.gui.updateUI <- func() {
+		at.addLog("🎉 HOÀN THÀNH TOKEN EXTRACTION!")
+		at.addLog(fmt.Sprintf("📈 Kết quả: Success: %d | Fail: %d | Total: %d",
+			successCount, failCount, len(at.accounts)))
+
+		if successCount > 0 {
+			at.addLog("✅ Có thể bắt đầu crawl emails với tokens đã có!")
+		}
+	}
+}
+
 func (at *AccountsTab) CleanAllAccounts() {
 	dialog.ShowConfirm("Clean All", "Xoá hết account?", func(ok bool) {
 		if ok {
@@ -160,17 +334,24 @@ func (at *AccountsTab) CleanAllAccounts() {
 			at.accountData = binding.NewStringList()
 			at.setupAccountsList()
 			at.updateStats()
-			at.addLog("Đã xoá hết account.")
+			at.addLog("🗑️ Đã xoá hết accounts.")
 		}
 	}, at.gui.window)
 }
+
 func (at *AccountsTab) addLog(msg string) {
 	ts := time.Now().Format("15:04:05")
-	at.logBuffer = append(at.logBuffer, fmt.Sprintf("[%s] %s", ts, msg))
-	if len(at.logBuffer) > 100 {
-		at.logBuffer = at.logBuffer[len(at.logBuffer)-100:]
+	logEntry := fmt.Sprintf("[%s] %s", ts, msg)
+	at.logBuffer = append(at.logBuffer, logEntry)
+
+	// Keep only last 200 entries
+	if len(at.logBuffer) > 200 {
+		at.logBuffer = at.logBuffer[len(at.logBuffer)-200:]
 	}
-	at.logText.ParseMarkdown("```\n" + strings.Join(at.logBuffer, "\n") + "\n```")
+
+	// Update display
+	displayText := "```\n" + strings.Join(at.logBuffer, "\n") + "\n```"
+	at.logText.ParseMarkdown(displayText)
 }
 
 func (at *AccountsTab) ImportAccounts() {
@@ -224,6 +405,7 @@ func (at *AccountsTab) ImportAccounts() {
 			message := fmt.Sprintf("Imported: %d | Skipped: %d", imported, skipped)
 			dialog.ShowInformation("Import Results", message, at.gui.window)
 			at.gui.updateStatus(fmt.Sprintf("Imported %d accounts", imported))
+			at.addLog(fmt.Sprintf("📥 Import: %d accounts thành công, %d bị bỏ qua", imported, skipped))
 		}
 	}, at.gui.window)
 }
@@ -255,6 +437,7 @@ user1@company.com|password123
 		at.accountsList.Refresh()
 		at.updateStats()
 		at.gui.updateStatus(fmt.Sprintf("Loaded %d accounts", len(accounts)))
+		at.addLog(fmt.Sprintf("📂 Loaded %d accounts từ file", len(accounts)))
 	}
 }
 
@@ -280,6 +463,7 @@ func (at *AccountsTab) SaveAccounts() {
 	}
 	at.gui.updateUI <- func() {
 		at.gui.updateStatus(fmt.Sprintf("Saved %d accounts", len(at.accounts)))
+		at.addLog(fmt.Sprintf("💾 Saved %d accounts to file", len(at.accounts)))
 	}
 }
 
@@ -307,6 +491,7 @@ func (at *AccountsTab) ValidateAllAccounts() {
 	at.gui.updateUI <- func() {
 		dialog.ShowInformation("Validation Results", message, at.gui.window)
 		at.gui.updateStatus(fmt.Sprintf("Validated %d accounts", len(at.accounts)))
+		at.addLog(fmt.Sprintf("✅ Validation: %d valid, %d invalid accounts", valid, invalid))
 	}
 }
 
@@ -333,6 +518,7 @@ func (at *AccountsTab) RemoveFailedAccounts() {
 						at.accountsList.Refresh()
 						at.updateStats()
 						at.gui.updateStatus(fmt.Sprintf("Removed %d failed accounts", removedCount))
+						at.addLog(fmt.Sprintf("🗑️ Removed %d failed accounts", removedCount))
 					}
 				}
 			}, at.gui.window)
@@ -377,6 +563,7 @@ func (at *AccountsTab) ExportValidAccounts() {
 		}
 		at.gui.updateUI <- func() {
 			at.gui.updateStatus(fmt.Sprintf("Exported %d valid accounts", len(validAccounts)))
+			at.addLog(fmt.Sprintf("📤 Exported %d valid accounts", len(validAccounts)))
 		}
 	}, at.gui.window)
 }

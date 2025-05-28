@@ -155,7 +155,6 @@ func (rt *ResultsTab) RefreshResults() {
 
 	file, err := os.Open("hit.txt")
 	if err != nil {
-		rt.gui.updateStatus("No results file found")
 		rt.updateSummary()
 		rt.resultsTable.Refresh()
 		return
@@ -185,7 +184,6 @@ func (rt *ResultsTab) RefreshResults() {
 	}
 	rt.updateSummary()
 	rt.resultsTable.Refresh()
-	rt.gui.updateStatus(fmt.Sprintf("Loaded %d results", len(rt.results)))
 }
 
 // ExportResults exports results to a file
@@ -216,7 +214,6 @@ func (rt *ResultsTab) ExportResults() {
 			dialog.ShowError(err, rt.gui.window)
 			return
 		}
-		rt.gui.updateStatus(fmt.Sprintf("Exported %d results", len(rt.results)))
 	}, rt.gui.window)
 }
 
@@ -233,7 +230,6 @@ func (rt *ResultsTab) ClearResults() {
 				rt.results = []CrawlerResult{}
 				rt.updateSummary()
 				rt.resultsTable.Refresh()
-				rt.gui.updateStatus("Cleared all results")
 			}
 		}, rt.gui.window)
 }
