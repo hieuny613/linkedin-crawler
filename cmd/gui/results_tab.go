@@ -15,7 +15,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// NewResultsTab creates a new results tab with auto-refresh functionality
+// NewResultsTab creates a new results tab with auto-refresh functionality and deduplication
 func NewResultsTab(gui *CrawlerGUI) *ResultsTab {
 	tab := &ResultsTab{
 		gui:     gui,
@@ -78,6 +78,8 @@ func (rt *ResultsTab) CreateContent() fyne.CanvasObject {
 		rt.clearBtn,
 		widget.NewSeparator(),
 		rt.autoRefreshCheck,
+		widget.NewSeparator(),
+		widget.NewButton("Remove Duplicates", rt.RemoveDuplicates), // NEW: Remove duplicates button
 	)
 
 	// Filter and sort row
@@ -228,10 +230,13 @@ func (rt *ResultsTab) setupResultsTable() {
 	rt.resultsTable.SetColumnWidth(5, 100) // Status
 }
 
-// RefreshResults refreshes the results from hit.txt file
+// RefreshResults refreshes the results from hit.txt file with DEDUPLICATION
 func (rt *ResultsTab) RefreshResults() {
 	oldCount := len(rt.results)
-	rt.results = []CrawlerResult{}
+
+	// Use map để tránh trùng lặp
+	resultsMap := make(map[string]CrawlerResult) // key = email (lowercase)
+	duplicatesCount := 0
 
 	file, err := os.Open("hit.txt")
 	if err != nil {
@@ -245,52 +250,139 @@ func (rt *ResultsTab) RefreshResults() {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	newResults := 0
+	totalLines := 0
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+
+		totalLines++
 		parts := strings.Split(line, "|")
 		if len(parts) >= 5 {
+			email := strings.TrimSpace(parts[0])
+			emailKey := strings.ToLower(email) // Normalize email for deduplication
+
 			result := CrawlerResult{
-				Email:       parts[0],
-				Name:        parts[1],
-				LinkedInURL: parts[2],
-				Location:    parts[3],
-				Connections: parts[4],
+				Email:       email,
+				Name:        strings.TrimSpace(parts[1]),
+				LinkedInURL: strings.TrimSpace(parts[2]),
+				Location:    strings.TrimSpace(parts[3]),
+				Connections: strings.TrimSpace(parts[4]),
 				Status:      "Found",
 				Timestamp:   time.Now(),
 			}
-			rt.results = append(rt.results, result)
-			newResults++
+
+			// Check for duplicates
+			if _, exists := resultsMap[emailKey]; exists {
+				duplicatesCount++
+				// Keep the newer/better result (can add logic here)
+				continue
+			}
+
+			resultsMap[emailKey] = result
 		}
 	}
+
+	// Convert map to slice
+	rt.results = make([]CrawlerResult, 0, len(resultsMap))
+	for _, result := range resultsMap {
+		rt.results = append(rt.results, result)
+	}
+
+	// Sort by timestamp (newest first)
+	sort.Slice(rt.results, func(i, j int) bool {
+		return rt.results[i].Timestamp.After(rt.results[j].Timestamp)
+	})
 
 	rt.updateSummary()
 	rt.resultsTable.Refresh()
 
-	// Update status with new results info
+	newResults := len(rt.results)
+
+	// Update status with deduplication info
 	if newResults > oldCount {
 		newCount := newResults - oldCount
-		rt.gui.updateStatus(fmt.Sprintf("Found %d new results (Total: %d)", newCount, newResults))
-
-		// Log to control tab if available
-		if rt.gui.controlTab != nil {
-			rt.gui.controlTab.AddCustomActivity(fmt.Sprintf("🎉 New results: +%d LinkedIn profiles (Total: %d)", newCount, newResults))
+		statusMsg := fmt.Sprintf("Found %d new results (Total: %d)", newCount, newResults)
+		if duplicatesCount > 0 {
+			statusMsg += fmt.Sprintf(" | Removed %d duplicates", duplicatesCount)
 		}
+		rt.gui.updateStatus(statusMsg)
 
-		// Log to emails tab if available
+		// Log to emails tab if available (removed controlTab reference)
 		if rt.gui.emailsTab != nil {
-			rt.gui.emailsTab.LogSuccess("Found %d new LinkedIn profiles! Check Results tab")
+			rt.gui.emailsTab.LogSuccess(fmt.Sprintf("Found %d new LinkedIn profiles! Check Results tab", newCount))
 		}
 	} else if !rt.autoRefresh {
-		rt.gui.updateStatus(fmt.Sprintf("Results refreshed: %d total", newResults))
+		statusMsg := fmt.Sprintf("Results refreshed: %d total", newResults)
+		if duplicatesCount > 0 {
+			statusMsg += fmt.Sprintf(" | Removed %d duplicates", duplicatesCount)
+		}
+		rt.gui.updateStatus(statusMsg)
+	}
+
+	// Log duplicates info if found
+	if duplicatesCount > 0 && !rt.autoRefresh {
+		if rt.gui.emailsTab != nil {
+			rt.gui.emailsTab.LogInfo(fmt.Sprintf("Removed %d duplicate entries from results", duplicatesCount))
+		}
 	}
 }
 
-// ExportResults exports results to a file
+// RemoveDuplicates manually removes duplicates from current results
+func (rt *ResultsTab) RemoveDuplicates() {
+	if len(rt.results) == 0 {
+		dialog.ShowInformation("No Data", "No results to process", rt.gui.window)
+		return
+	}
+
+	originalCount := len(rt.results)
+
+	// Use map để tránh trùng lặp
+	resultsMap := make(map[string]CrawlerResult) // key = email (lowercase)
+
+	for _, result := range rt.results {
+		emailKey := strings.ToLower(strings.TrimSpace(result.Email))
+
+		// Keep the first occurrence or the one with more data
+		if existing, exists := resultsMap[emailKey]; exists {
+			// Keep the result with more LinkedIn info or newer timestamp
+			if (result.LinkedInURL != "" && result.LinkedInURL != "N/A") &&
+				(existing.LinkedInURL == "" || existing.LinkedInURL == "N/A") {
+				resultsMap[emailKey] = result
+			} else if result.Timestamp.After(existing.Timestamp) {
+				resultsMap[emailKey] = result
+			}
+		} else {
+			resultsMap[emailKey] = result
+		}
+	}
+
+	// Convert map back to slice
+	rt.results = make([]CrawlerResult, 0, len(resultsMap))
+	for _, result := range resultsMap {
+		rt.results = append(rt.results, result)
+	}
+
+	// Sort by timestamp (newest first)
+	sort.Slice(rt.results, func(i, j int) bool {
+		return rt.results[i].Timestamp.After(rt.results[j].Timestamp)
+	})
+
+	duplicatesRemoved := originalCount - len(rt.results)
+
+	rt.updateSummary()
+	rt.resultsTable.Refresh()
+
+	message := fmt.Sprintf("Removed %d duplicates\nResults: %d → %d",
+		duplicatesRemoved, originalCount, len(rt.results))
+
+	dialog.ShowInformation("Remove Duplicates", message, rt.gui.window)
+	rt.gui.updateStatus(fmt.Sprintf("Removed %d duplicates from results", duplicatesRemoved))
+}
+
+// ExportResults exports results to a file with deduplication
 func (rt *ResultsTab) ExportResults() {
 	if len(rt.results) == 0 {
 		dialog.ShowInformation("No Data", "No results to export", rt.gui.window)
@@ -305,20 +397,35 @@ func (rt *ResultsTab) ExportResults() {
 
 		var lines []string
 		lines = append(lines, "Email,Name,LinkedIn URL,Location,Connections,Status,Timestamp")
+
+		// Use map để ensure no duplicates in export
+		exportMap := make(map[string]CrawlerResult)
 		for _, result := range rt.results {
+			emailKey := strings.ToLower(strings.TrimSpace(result.Email))
+			exportMap[emailKey] = result
+		}
+
+		for _, result := range exportMap {
 			line := fmt.Sprintf("%s,%s,%s,%s,%s,%s,%s",
 				result.Email, result.Name, result.LinkedInURL,
 				result.Location, result.Connections, result.Status,
 				result.Timestamp.Format("2006-01-02 15:04:05"))
 			lines = append(lines, line)
 		}
+
 		content := strings.Join(lines, "\n")
 		_, err = writer.Write([]byte(content))
 		if err != nil {
 			dialog.ShowError(err, rt.gui.window)
 			return
 		}
-		rt.gui.updateStatus(fmt.Sprintf("Exported %d results to CSV", len(rt.results)))
+
+		duplicatesSkipped := len(rt.results) - len(exportMap)
+		statusMsg := fmt.Sprintf("Exported %d unique results to CSV", len(exportMap))
+		if duplicatesSkipped > 0 {
+			statusMsg += fmt.Sprintf(" (skipped %d duplicates)", duplicatesSkipped)
+		}
+		rt.gui.updateStatus(statusMsg)
 	}, rt.gui.window)
 }
 
@@ -334,6 +441,7 @@ func (rt *ResultsTab) ClearResults() {
 		func(confirmed bool) {
 			if confirmed {
 				rt.results = []CrawlerResult{}
+				rt.originalResults = nil // Clear backup as well
 				rt.updateSummary()
 				rt.resultsTable.Refresh()
 				rt.gui.updateStatus("Cleared all results")
@@ -341,14 +449,27 @@ func (rt *ResultsTab) ClearResults() {
 		}, rt.gui.window)
 }
 
-// updateSummary updates the summary card with real-time info
+// updateSummary updates the summary card with real-time info and duplicate detection
 func (rt *ResultsTab) updateSummary() {
 	total := len(rt.results)
 	withLinkedIn := 0
 
+	// Count unique emails and detect potential duplicates
+	emailMap := make(map[string]int)
 	for _, result := range rt.results {
+		emailKey := strings.ToLower(strings.TrimSpace(result.Email))
+		emailMap[emailKey]++
+
 		if result.LinkedInURL != "" && result.LinkedInURL != "N/A" {
 			withLinkedIn++
+		}
+	}
+
+	// Count duplicates (emails that appear more than once)
+	duplicateEmails := 0
+	for _, count := range emailMap {
+		if count > 1 {
+			duplicateEmails += count - 1 // Count extra occurrences as duplicates
 		}
 	}
 
@@ -391,17 +512,31 @@ func (rt *ResultsTab) updateSummary() {
 		refreshStatus = "⏸️ **Auto-refresh:** OFF"
 	}
 
+	// Include duplicate detection info
+	duplicateInfo := ""
+	if duplicateEmails > 0 {
+		duplicateInfo = fmt.Sprintf(`
+⚠️ **Duplicates Detected:** %d duplicate entries found
+💡 **Tip:** Click "Remove Duplicates" button to clean up
+`, duplicateEmails)
+	} else {
+		duplicateInfo = "✅ **No Duplicates:** All entries are unique"
+	}
+
 	summaryText := fmt.Sprintf(`**LinkedIn Results Summary:**
 
 📊 **Total Found:** %d profiles
 🎯 **With LinkedIn:** %d profiles (%.1f%%)
 📭 **Without LinkedIn:** %d profiles (%.1f%%)
+🔍 **Unique Emails:** %d
 
 📈 **Find Rate:** %.1f%%
 📅 **Last Updated:** %s
 %s
 %s
-`, total, withLinkedIn, percentage, total-withLinkedIn, 100-percentage, percentage, time.Now().Format("15:04:05"), refreshStatus, additionalStats)
+%s
+`, total, withLinkedIn, percentage, total-withLinkedIn, 100-percentage, len(emailMap),
+		percentage, time.Now().Format("15:04:05"), refreshStatus, duplicateInfo, additionalStats)
 
 	rt.summaryCard.SetContent(widget.NewRichTextFromMarkdown(summaryText))
 }
@@ -507,6 +642,33 @@ func (rt *ResultsTab) GetLinkedInCount() int {
 		}
 	}
 	return count
+}
+
+// GetUniqueEmailsCount returns the number of unique emails
+func (rt *ResultsTab) GetUniqueEmailsCount() int {
+	emailMap := make(map[string]bool)
+	for _, result := range rt.results {
+		emailKey := strings.ToLower(strings.TrimSpace(result.Email))
+		emailMap[emailKey] = true
+	}
+	return len(emailMap)
+}
+
+// GetDuplicatesCount returns the number of duplicate entries
+func (rt *ResultsTab) GetDuplicatesCount() int {
+	emailMap := make(map[string]int)
+	for _, result := range rt.results {
+		emailKey := strings.ToLower(strings.TrimSpace(result.Email))
+		emailMap[emailKey]++
+	}
+
+	duplicates := 0
+	for _, count := range emailMap {
+		if count > 1 {
+			duplicates += count - 1
+		}
+	}
+	return duplicates
 }
 
 // IsAutoRefreshEnabled returns whether auto-refresh is enabled

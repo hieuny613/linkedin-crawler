@@ -18,6 +18,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"linkedin-crawler/internal/orchestrator"
+	"linkedin-crawler/internal/utils"
 )
 
 type CrawlerGUI struct {
@@ -32,7 +33,6 @@ type CrawlerGUI struct {
 	accountsTab *AccountsTab
 	emailsTab   *EmailsTab
 	resultsTab  *ResultsTab
-	controlTab  *ControlTab
 
 	statusBar *widget.Label
 
@@ -53,6 +53,10 @@ func main() {
 		os.MkdirAll(appDir, 0755)
 	}
 
+	// Auto-deduplicate hit.txt on startup
+	fmt.Println("🔄 Checking for duplicates in hit.txt...")
+	utils.AutoDeduplicateOnStartup()
+
 	gui := NewCrawlerGUI()
 
 	// Bắt đầu goroutine xử lý mọi cập nhật UI qua channel updateUI
@@ -64,6 +68,27 @@ func main() {
 
 	gui.setupUI()
 	gui.loadSettings()
+
+	// Kiểm tra file hit.txt và cảnh báo nếu có vấn đề (cũng update qua UI channel)
+	gui.updateUI <- func() {
+		if _, err := os.Stat("hit.txt"); err == nil {
+			issues := utils.ValidateHitFile("hit.txt")
+			if len(issues) > 1 || (len(issues) == 1 && issues[0] != "File validation passed - no issues found") {
+				issuesText := "Hit.txt validation results:\n\n" + fmt.Sprintf("Found %d issues:\n", len(issues))
+				for i, issue := range issues {
+					if i < 10 {
+						issuesText += fmt.Sprintf("• %s\n", issue)
+					}
+				}
+				if len(issues) > 10 {
+					issuesText += fmt.Sprintf("... and %d more issues\n", len(issues)-10)
+				}
+				issuesText += "\nRecommendation: Use 'Remove Duplicates' in Results tab"
+				dialog.ShowInformation("Hit.txt Validation", issuesText, gui.window)
+			}
+		}
+	}
+
 	gui.window.ShowAndRun()
 }
 
@@ -150,7 +175,6 @@ func (gui *CrawlerGUI) setupUI() {
 }
 
 func (gui *CrawlerGUI) loadSettings() {
-	// Mọi cập nhật UI đều gửi vào channel (kể cả khi gọi từ main goroutine)
 	gui.updateUI <- func() { gui.configTab.LoadConfig() }
 	gui.updateUI <- func() { gui.accountsTab.LoadAccounts() }
 	gui.updateUI <- func() { gui.emailsTab.LoadEmails() }
@@ -198,24 +222,42 @@ func (gui *CrawlerGUI) startCrawler() {
 		}
 		gui.autoCrawler = autoCrawler
 		gui.isRunning = true
-		gui.updateUI <- func() { gui.updateStatus("Running...") }
+
+		// Notify emailsTab that crawler started
+		gui.updateUI <- func() {
+			gui.updateStatus("Running...")
+			if gui.emailsTab != nil {
+				gui.emailsTab.OnCrawlerStarted()
+			}
+		}
+
 		err = autoCrawler.Run()
 		gui.crawlerMux.Lock()
 		gui.isRunning = false
 		gui.autoCrawler = nil
 		gui.crawlerMux.Unlock()
-		gui.updateUI <- func() { gui.updateStatus("Completed") }
-		if err != nil {
-			gui.updateUI <- func() { gui.updateStatus("Stopped with errors") }
-		} else {
-			gui.updateUI <- func() {
+
+		gui.updateUI <- func() {
+			// Notify emailsTab that crawler stopped
+			if gui.emailsTab != nil {
+				gui.emailsTab.OnCrawlerStopped()
+			}
+
+			if err != nil {
+				gui.updateStatus("Stopped with errors")
+			} else {
 				gui.updateStatus("Completed successfully")
 				gui.resultsTab.RefreshResults()
 			}
 		}
+
 		gui.updateUI <- func() {
 			if gui.window != nil {
-				dialog.ShowInformation("Complete", "Crawling finished", gui.window)
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("Crawling completed with errors: %v", err), gui.window)
+				} else {
+					dialog.ShowInformation("Complete", "Crawling finished successfully", gui.window)
+				}
 			}
 		}
 	}()
@@ -237,6 +279,18 @@ func (gui *CrawlerGUI) stopCrawler() {
 func (gui *CrawlerGUI) cleanup() {
 	gui.cancel()
 	gui.saveSettings()
+
+	// Stop all refresh tickers
+	if gui.emailsTab != nil && gui.emailsTab.statsRefreshTicker != nil {
+		gui.emailsTab.statsRefreshTicker.Stop()
+	}
+	if gui.resultsTab != nil {
+		gui.resultsTab.Cleanup()
+	}
+	// Không còn cleanup cho controlTab!
+	if gui.accountsTab != nil && gui.accountsTab.tokenInfoTicker != nil {
+		gui.accountsTab.tokenInfoTicker.Stop()
+	}
 }
 
 func (gui *CrawlerGUI) updateStatus(status string) {

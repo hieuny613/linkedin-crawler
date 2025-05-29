@@ -45,57 +45,11 @@ func (et *EmailsTab) UpdateProgress(processed, total int, message string) {
 	et.gui.updateUI <- func() {
 		et.addLog(fmt.Sprintf("📊 %s", message))
 
-		// Update progress in control tab if available
-		if et.gui.controlTab != nil {
-			if total > 0 {
-				progress := float64(processed) / float64(total)
-				et.gui.controlTab.progressBar.SetValue(progress)
-				et.gui.controlTab.progressLabel.SetText(fmt.Sprintf("Progress: %d/%d (%.1f%%)", processed, total, progress*100))
-			}
-
-			// Also update activity in control tab
-			et.gui.controlTab.updateActivity(fmt.Sprintf("📊 %s", message))
-		}
-	}
-}
-
-// =============================================================================
-// ControlTab implements GUILogger interface
-// =============================================================================
-
-func (ct *ControlTab) LogInfo(message string) {
-	ct.gui.updateUI <- func() {
-		ct.updateActivity(fmt.Sprintf("ℹ️ %s", message))
-	}
-}
-
-func (ct *ControlTab) LogWarning(message string) {
-	ct.gui.updateUI <- func() {
-		ct.updateActivity(fmt.Sprintf("⚠️ %s", message))
-	}
-}
-
-func (ct *ControlTab) LogError(message string) {
-	ct.gui.updateUI <- func() {
-		ct.updateActivity(fmt.Sprintf("❌ %s", message))
-	}
-}
-
-func (ct *ControlTab) LogSuccess(message string) {
-	ct.gui.updateUI <- func() {
-		ct.updateActivity(fmt.Sprintf("✅ %s", message))
-	}
-}
-
-func (ct *ControlTab) UpdateProgress(processed, total int, message string) {
-	ct.gui.updateUI <- func() {
-		ct.updateActivity(fmt.Sprintf("📊 %s", message))
-
-		// Update progress bar
+		// Update progress in status bar instead of control tab
 		if total > 0 {
 			progress := float64(processed) / float64(total)
-			ct.progressBar.SetValue(progress)
-			ct.progressLabel.SetText(fmt.Sprintf("Progress: %d/%d (%.1f%%)", processed, total, progress*100))
+			progressMsg := fmt.Sprintf("Progress: %d/%d (%.1f%%)", processed, total, progress*100)
+			et.gui.updateStatus(progressMsg)
 		}
 	}
 }
@@ -137,6 +91,8 @@ func (at *AccountsTab) UpdateProgress(processed, total int, message string) {
 			progress := float64(processed) / float64(total)
 			progressMsg := fmt.Sprintf("Token extraction: %.1f%% (%d/%d)", progress*100, processed, total)
 			at.addLog(progressMsg)
+			// Update status bar with token extraction progress
+			at.gui.updateStatus(fmt.Sprintf("Extracting tokens: %.1f%%", progress*100))
 		}
 	}
 }
@@ -145,21 +101,10 @@ func (at *AccountsTab) UpdateProgress(processed, total int, message string) {
 // Helper functions for GUI Logger integration
 // =============================================================================
 
-// GetPrimaryGUILogger returns the primary GUI logger (usually EmailsTab)
+// GetPrimaryGUILogger returns the primary GUI logger (EmailsTab)
 func (gui *CrawlerGUI) GetPrimaryGUILogger() GUILogger {
 	if gui.emailsTab != nil {
 		return gui.emailsTab
-	}
-	if gui.controlTab != nil {
-		return gui.controlTab
-	}
-	return nil
-}
-
-// GetControlGUILogger returns the control tab as GUI logger
-func (gui *CrawlerGUI) GetControlGUILogger() GUILogger {
-	if gui.controlTab != nil {
-		return gui.controlTab
 	}
 	return nil
 }
@@ -178,9 +123,6 @@ func (gui *CrawlerGUI) BroadcastLog(logType string, message string) {
 
 	if gui.emailsTab != nil {
 		loggers = append(loggers, gui.emailsTab)
-	}
-	if gui.controlTab != nil {
-		loggers = append(loggers, gui.controlTab)
 	}
 	if gui.accountsTab != nil {
 		loggers = append(loggers, gui.accountsTab)
@@ -226,11 +168,6 @@ func (gui *CrawlerGUI) UpdateGUIProgress(processed, total int, format string, ar
 	// Update primary logger (emails tab)
 	if gui.emailsTab != nil {
 		gui.emailsTab.UpdateProgress(processed, total, message)
-	}
-
-	// Update control tab
-	if gui.controlTab != nil {
-		gui.controlTab.UpdateProgress(processed, total, message)
 	}
 }
 
