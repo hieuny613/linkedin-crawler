@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"linkedin-crawler/internal/licensing"
 	"linkedin-crawler/internal/models"
 	"linkedin-crawler/internal/storage"
 	"linkedin-crawler/internal/utils"
@@ -333,4 +334,25 @@ func (ac *AutoCrawler) SetCrawler(crawler *models.LinkedInCrawler) {
 
 func (ac *AutoCrawler) GetFileOpMutex() *sync.Mutex {
 	return &ac.fileOpMutex
+}
+func (ac *AutoCrawler) GetBatchProcessor() *BatchProcessor {
+	return ac.batchProcessor
+}
+
+// SetLicenseWrapper sets license wrapper for all components
+func (ac *AutoCrawler) SetLicenseWrapper(wrapper *licensing.LicensedCrawlerWrapper) {
+	if ac.batchProcessor != nil {
+		ac.batchProcessor.SetLicenseWrapper(wrapper)
+	}
+}
+
+// GetLicenseStats returns license usage statistics
+func (ac *AutoCrawler) GetLicenseStats() map[string]interface{} {
+	if ac.batchProcessor != nil {
+		return ac.batchProcessor.GetLicenseStats()
+	}
+	return map[string]interface{}{
+		"license_active": false,
+		"error":          "batch processor not initialized",
+	}
 }

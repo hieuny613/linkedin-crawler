@@ -269,11 +269,11 @@ func (lm *LicenseManager) parseCustomLicenseKey(licenseKey string) (*LicenseInfo
 	switch licenseType {
 	case LicenseTypeTrial:
 		info.MaxEmails = 100
-		info.MaxAccounts = 2
+		info.MaxAccounts = -1
 		info.Features = []string{"basic_crawling", "gui_interface"}
 	case LicenseTypePersonal:
 		info.MaxEmails = 5000
-		info.MaxAccounts = 10
+		info.MaxAccounts = -1
 		info.Features = []string{"basic_crawling", "gui_interface", "export_tools", "bulk_processing"}
 	case LicenseTypePro:
 		info.MaxEmails = -1   // Unlimited

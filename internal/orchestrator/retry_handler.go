@@ -110,7 +110,7 @@ func (rh *RetryHandler) RetryFailedEmails() error {
 
 		// Record email count before retry
 		emailsBefore := len(retryEmails)
-		_, _ = batchProcessor.crawlWithCurrentTokens(retryEmails)
+		_, _ = batchProcessor.crawlWithCurrentTokensAndLicenseCheck(retryEmails)
 
 		// Close crawler
 		crawlerInstance := rh.autoCrawler.GetCrawler()

@@ -78,7 +78,7 @@ type EmailsTab struct {
 func NewEmailsTab(gui *CrawlerGUI) *EmailsTab {
 	tab := &EmailsTab{
 		gui:              gui,
-		emails:           []string{},
+		emails:           []string{}, // Khởi tạo với empty slice thay vì nil
 		emailData:        binding.NewStringList(),
 		emailStatusCache: make(map[string]string),
 		lastCacheUpdate:  time.Time{},
@@ -88,9 +88,13 @@ func NewEmailsTab(gui *CrawlerGUI) *EmailsTab {
 		emailsPerPage:    1000, // 1000 emails per page
 		maxDisplayEmails: 5000, // Max 5000 emails in UI at once
 		currentPage:      0,
-		displayEmails:    []string{},
+		displayEmails:    []string{}, // Khởi tạo với empty slice thay vì nil
+
+		// Initialize counters
+		totalEmailCount: 0,
 	}
 
+	// Initialize UI components
 	tab.importBtn = widget.NewButtonWithIcon("Import", theme.FolderOpenIcon(), tab.ImportEmails)
 	tab.clearBtn = widget.NewButtonWithIcon("Clear All", theme.DeleteIcon(), tab.ClearAllEmails)
 	tab.clearBtn.Importance = widget.DangerImportance
@@ -102,8 +106,9 @@ func NewEmailsTab(gui *CrawlerGUI) *EmailsTab {
 
 	tab.logText = widget.NewRichText()
 	tab.logText.Wrapping = fyne.TextWrapWord
-	tab.logBuffer = []string{}
+	tab.logBuffer = []string{} // Initialize with empty slice
 
+	// Initialize labels
 	tab.totalLabel = widget.NewLabel("Total: 0")
 	tab.pendingLabel = widget.NewLabel("Pending: 0")
 	tab.successLabel = widget.NewLabel("Success: 0")
@@ -114,6 +119,7 @@ func NewEmailsTab(gui *CrawlerGUI) *EmailsTab {
 	tab.progressLabel = widget.NewLabel("Ready")
 	tab.statusLabel = widget.NewLabel("Status: Ready")
 
+	// Setup emails list with safety checks
 	tab.setupEmailsList()
 
 	// Start stats refresh ticker with throttling
@@ -122,6 +128,19 @@ func NewEmailsTab(gui *CrawlerGUI) *EmailsTab {
 	return tab
 }
 
+// getTotalPages with safety checks
+func (et *EmailsTab) getTotalPages() int {
+	if et.emailsPerPage <= 0 {
+		return 1
+	}
+
+	// SAFETY CHECK: Sử dụng totalEmailCount thay vì len(emails) để tránh nil pointer
+	totalPages := (et.totalEmailCount + et.emailsPerPage - 1) / et.emailsPerPage
+	if totalPages == 0 {
+		return 1
+	}
+	return totalPages
+}
 func (et *EmailsTab) CreateContent() fyne.CanvasObject {
 	fileButtons := container.NewHBox(
 		et.importBtn,
@@ -231,30 +250,27 @@ func (et *EmailsTab) CreateContent() fyne.CanvasObject {
 	return content
 }
 
-// OPTIMIZATION: Virtual scrolling với pagination
-func (et *EmailsTab) getTotalPages() int {
-	if et.emailsPerPage <= 0 {
-		return 1
-	}
-	totalPages := (et.totalEmailCount + et.emailsPerPage - 1) / et.emailsPerPage
-	if totalPages == 0 {
-		return 1
-	}
-	return totalPages
-}
-
 // OPTIMIZATION: Update display emails for current page
 func (et *EmailsTab) updateDisplayEmails() {
+	// SAFETY CHECK: Kiểm tra nếu emails là nil hoặc empty
+	if et.emails == nil {
+		et.emails = []string{}
+	}
+
 	if len(et.emails) == 0 {
 		et.displayEmails = []string{}
 		et.updateEmailsList()
-		et.updatePageInfo()
+		if et.updatePageInfo != nil {
+			et.updatePageInfo()
+		}
 		return
 	}
 
+	// SAFETY CHECK: Kiểm tra bounds
 	start := et.currentPage * et.emailsPerPage
 	end := start + et.emailsPerPage
 
+	// Bounds checking
 	if start >= len(et.emails) {
 		et.currentPage = 0
 		start = 0
@@ -265,25 +281,66 @@ func (et *EmailsTab) updateDisplayEmails() {
 		end = len(et.emails)
 	}
 
-	et.displayEmails = et.emails[start:end]
+	// SAFETY CHECK: Đảm bảo start không âm
+	if start < 0 {
+		start = 0
+	}
+
+	// SAFETY CHECK: Đảm bảo end không âm và không lớn hơn start
+	if end < start {
+		end = start
+	}
+
+	// Extract display emails safely
+	et.displayEmails = make([]string, 0, end-start)
+	for i := start; i < end; i++ {
+		if i < len(et.emails) {
+			et.displayEmails = append(et.displayEmails, et.emails[i])
+		}
+	}
+
 	et.updateEmailsList()
-	et.updatePageInfo()
+
+	// SAFETY CHECK: Kiểm tra updatePageInfo không nil
+	if et.updatePageInfo != nil {
+		et.updatePageInfo()
+	}
 }
 
 // OPTIMIZATION: Update emails list với limited items
 func (et *EmailsTab) updateEmailsList() {
+	// SAFETY CHECK: Kiểm tra emailData không nil
+	if et.emailData == nil {
+		et.emailData = binding.NewStringList()
+	}
+
 	// Clear existing data
 	et.emailData = binding.NewStringList()
 
-	// Add only display emails (max 1000 per page)
-	for _, email := range et.displayEmails {
-		et.emailData.Append(email)
+	// SAFETY CHECK: Kiểm tra displayEmails không nil
+	if et.displayEmails == nil {
+		et.displayEmails = []string{}
 	}
 
-	et.emailsList.Refresh()
+	// Add only display emails (max 1000 per page)
+	for _, email := range et.displayEmails {
+		if email != "" { // Skip empty emails
+			et.emailData.Append(email)
+		}
+	}
+
+	// SAFETY CHECK: Kiểm tra emailsList không nil trước khi refresh
+	if et.emailsList != nil {
+		et.emailsList.Refresh()
+	}
 }
 
 func (et *EmailsTab) setupEmailsList() {
+	// SAFETY CHECK: Đảm bảo emailData được khởi tạo
+	if et.emailData == nil {
+		et.emailData = binding.NewStringList()
+	}
+
 	et.emailsList = widget.NewListWithData(
 		et.emailData,
 		func() fyne.CanvasObject {
@@ -293,17 +350,46 @@ func (et *EmailsTab) setupEmailsList() {
 			return container.NewHBox(icon, container.NewVBox(email, status))
 		},
 		func(id binding.DataItem, obj fyne.CanvasObject) {
-			str, _ := id.(binding.String).Get()
-			container := obj.(*fyne.Container)
-			icon := container.Objects[0].(*widget.Icon)
-			infoContainer := container.Objects[1].(*fyne.Container)
-			emailLabel := infoContainer.Objects[0].(*widget.Label)
-			statusLabel := infoContainer.Objects[1].(*widget.Label)
+			// SAFETY CHECK: Kiểm tra obj không nil
+			if obj == nil {
+				return
+			}
+
+			str, err := id.(binding.String).Get()
+			if err != nil {
+				return // Skip if error getting string
+			}
+
+			container, ok := obj.(*fyne.Container)
+			if !ok || container == nil || len(container.Objects) < 2 {
+				return // Skip if cast fails or container invalid
+			}
+
+			icon, ok := container.Objects[0].(*widget.Icon)
+			if !ok || icon == nil {
+				return
+			}
+
+			infoContainer, ok := container.Objects[1].(*fyne.Container)
+			if !ok || infoContainer == nil || len(infoContainer.Objects) < 2 {
+				return
+			}
+
+			emailLabel, ok := infoContainer.Objects[0].(*widget.Label)
+			if !ok || emailLabel == nil {
+				return
+			}
+
+			statusLabel, ok := infoContainer.Objects[1].(*widget.Label)
+			if !ok || statusLabel == nil {
+				return
+			}
+
 			emailLabel.SetText(str)
 
 			// OPTIMIZATION: Only get status for visible emails
-			status := "Pending"              // Default status - avoid expensive DB queries for all emails
-			if len(et.displayEmails) < 100 { // Only get real status for small lists
+			status := "Pending"                                         // Default status - avoid expensive DB queries for all emails
+			if et.displayEmails != nil && len(et.displayEmails) < 100 { // Only get real status for small lists
 				status = et.getEmailStatus(str)
 			}
 			statusLabel.SetText(status)
@@ -323,8 +409,10 @@ func (et *EmailsTab) setupEmailsList() {
 			}
 		},
 	)
+
 	et.emailsList.OnSelected = func(id widget.ListItemID) {
-		if int(id) < len(et.displayEmails) {
+		// SAFETY CHECK: Kiểm tra bounds
+		if et.displayEmails != nil && int(id) < len(et.displayEmails) {
 			et.selectedIndex = int(id)
 		}
 	}
@@ -458,6 +546,11 @@ func (et *EmailsTab) ImportEmails() {
 			}
 
 			processingTime := time.Since(startTime)
+
+			// SAFETY: Initialize if et.emails is nil
+			if et.emails == nil {
+				et.emails = []string{}
+			}
 
 			// OPTIMIZATION: Update UI with final results
 			et.gui.updateUI <- func() {
@@ -665,6 +758,11 @@ func (et *EmailsTab) StopCrawl() {
 
 // OPTIMIZATION: Clear all emails with confirmation for large datasets
 func (et *EmailsTab) ClearAllEmails() {
+	// SAFETY: Check if emails is nil or empty
+	if et.emails == nil {
+		et.emails = []string{}
+	}
+
 	if len(et.emails) == 0 {
 		return
 	}
@@ -687,7 +785,12 @@ func (et *EmailsTab) ClearAllEmails() {
 						defer progress.Hide()
 
 						// Clear cached stats
-						et.lastStats = make(map[string]int)
+						if et.lastStats == nil {
+							et.lastStats = make(map[string]int)
+						}
+						for k := range et.lastStats {
+							et.lastStats[k] = 0
+						}
 
 						// Clear both emails and emailData, then sync
 						et.emails = []string{}
@@ -696,27 +799,51 @@ func (et *EmailsTab) ClearAllEmails() {
 						et.displayEmails = []string{}
 
 						et.gui.updateUI <- func() {
-							et.emailData = binding.NewStringList()
-							et.emailsList.Refresh()
+							if et.emailData == nil {
+								et.emailData = binding.NewStringList()
+							} else {
+								et.emailData = binding.NewStringList()
+							}
+							if et.emailsList != nil {
+								et.emailsList.Refresh()
+							}
 							et.clearEmailStatusCache()
 							et.updateStats()
-							et.updatePageInfo()
+							if et.updatePageInfo != nil {
+								et.updatePageInfo()
+							}
 							et.gui.updateStatus("Cleared all emails")
 							et.addLog("🗑️ Đã xóa hết emails")
 						}
 					}()
 				} else {
 					// Immediate clear for small datasets
-					et.lastStats = make(map[string]int)
+					if et.lastStats == nil {
+						et.lastStats = make(map[string]int)
+					}
+					for k := range et.lastStats {
+						et.lastStats[k] = 0
+					}
+
 					et.emails = []string{}
 					et.totalEmailCount = 0
 					et.currentPage = 0
 					et.displayEmails = []string{}
-					et.emailData = binding.NewStringList()
-					et.emailsList.Refresh()
+
+					if et.emailData == nil {
+						et.emailData = binding.NewStringList()
+					} else {
+						et.emailData = binding.NewStringList()
+					}
+
+					if et.emailsList != nil {
+						et.emailsList.Refresh()
+					}
 					et.clearEmailStatusCache()
 					et.updateStats()
-					et.updatePageInfo()
+					if et.updatePageInfo != nil {
+						et.updatePageInfo()
+					}
 					et.gui.updateStatus("Cleared all emails")
 					et.addLog("🗑️ Đã xóa hết emails")
 				}
@@ -823,6 +950,11 @@ example@example.com
 			et.gui.updateStatus("No emails file found")
 		}
 		return
+	}
+
+	// SAFETY: Initialize emails slice nếu nil
+	if et.emails == nil {
+		et.emails = []string{}
 	}
 
 	// Store all emails
@@ -1371,6 +1503,9 @@ func (et *EmailsTab) addLog(msg string) {
 }
 
 func (et *EmailsTab) GetEmails() []string {
+	if et.emails == nil {
+		return []string{}
+	}
 	return et.emails
 }
 

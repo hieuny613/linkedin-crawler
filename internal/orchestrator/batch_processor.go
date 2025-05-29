@@ -10,19 +10,25 @@ import (
 
 	"linkedin-crawler/internal/auth"
 	"linkedin-crawler/internal/crawler"
+	"linkedin-crawler/internal/licensing"
 	"linkedin-crawler/internal/models"
 	"linkedin-crawler/internal/storage"
 )
 
-// BatchProcessor handles batch processing of emails with GUI logging
+// BatchProcessor handles batch processing of emails with GUI logging and license checking
 type BatchProcessor struct {
 	autoCrawler      *AutoCrawler
 	tokenExtractor   *auth.TokenExtractor
 	queryService     *crawler.QueryService
 	validatorService *crawler.ValidatorService
+	licenseWrapper   *licensing.LicensedCrawlerWrapper // License wrapper for checking
 
 	// GUI logging interface
 	guiLogger GUILogger
+
+	// License tracking
+	processedEmailsCount int32 // Track số emails đã process thành công
+	successEmailsCount   int32 // Track số emails thành công (có kết quả)
 }
 
 // GUILogger interface for sending logs to GUI
@@ -37,16 +43,24 @@ type GUILogger interface {
 // NewBatchProcessor creates a new BatchProcessor instance
 func NewBatchProcessor(ac *AutoCrawler) *BatchProcessor {
 	return &BatchProcessor{
-		autoCrawler:      ac,
-		tokenExtractor:   auth.NewTokenExtractor(),
-		queryService:     crawler.NewQueryService(),
-		validatorService: crawler.NewValidatorService(),
+		autoCrawler:          ac,
+		tokenExtractor:       auth.NewTokenExtractor(),
+		queryService:         crawler.NewQueryService(),
+		validatorService:     crawler.NewValidatorService(),
+		licenseWrapper:       licensing.NewLicensedCrawlerWrapper(),
+		processedEmailsCount: 0,
+		successEmailsCount:   0,
 	}
 }
 
 // SetGUILogger sets the GUI logger interface
 func (bp *BatchProcessor) SetGUILogger(logger GUILogger) {
 	bp.guiLogger = logger
+}
+
+// SetLicenseWrapper sets the license wrapper (for dependency injection)
+func (bp *BatchProcessor) SetLicenseWrapper(wrapper *licensing.LicensedCrawlerWrapper) {
+	bp.licenseWrapper = wrapper
 }
 
 // logInfo logs info message to GUI instead of console
@@ -89,9 +103,70 @@ func (bp *BatchProcessor) updateProgress(processed, total int, format string, ar
 	}
 }
 
-// ProcessAllEmails processes all emails with GUI logging
+// checkLicenseLimitsBeforeProcessing kiểm tra license trước khi process emails
+func (bp *BatchProcessor) checkLicenseLimitsBeforeProcessing(emailsToProcess int) error {
+	if bp.licenseWrapper == nil {
+		return fmt.Errorf("license not initialized")
+	}
+
+	// Lấy thống kê hiện tại
+	currentProcessed := atomic.LoadInt32(&bp.processedEmailsCount)
+
+	// Tính tổng số emails sẽ được process
+	totalWillProcess := int(currentProcessed) + emailsToProcess
+
+	// Lấy account count
+	accountCount := len(bp.autoCrawler.GetAccounts())
+
+	// Check license limits
+	err := bp.licenseWrapper.CheckCrawlingLimits(totalWillProcess, accountCount)
+	if err != nil {
+		bp.logError("License limit check failed: %v", err)
+		return err
+	}
+
+	bp.logInfo("✅ License check passed: Will process %d emails (total: %d)", emailsToProcess, totalWillProcess)
+	return nil
+}
+
+// checkLicenseLimitsDuringProcessing kiểm tra license trong quá trình process
+func (bp *BatchProcessor) checkLicenseLimitsDuringProcessing() error {
+	if bp.licenseWrapper == nil {
+		return fmt.Errorf("license not initialized")
+	}
+
+	// Lấy số emails đã process thành công
+	currentSuccess := atomic.LoadInt32(&bp.successEmailsCount)
+
+	// Lấy license info để check limits
+	info := bp.licenseWrapper.GetLicenseInfo()
+	maxEmails, ok := info["max_emails"].(int)
+	if !ok {
+		// Không thể lấy limit info, cho phép tiếp tục
+		return nil
+	}
+
+	// Nếu unlimited (-1), không cần check
+	if maxEmails <= 0 {
+		return nil
+	}
+
+	// Check nếu đã vượt quá limit
+	if int(currentSuccess) >= maxEmails {
+		return fmt.Errorf("email processing limit reached: %d/%d successful emails processed", currentSuccess, maxEmails)
+	}
+
+	// Cảnh báo khi gần đến limit
+	if int(currentSuccess) >= maxEmails-10 {
+		bp.logWarning("Approaching email limit: %d/%d emails processed", currentSuccess, maxEmails)
+	}
+
+	return nil
+}
+
+// ProcessAllEmails processes all emails with GUI logging and license checking
 func (bp *BatchProcessor) ProcessAllEmails() error {
-	bp.logInfo("🔄 Phase 1: Xử lý tất cả emails với token rotation...")
+	bp.logInfo("🔄 Phase 1: Xử lý tất cả emails với token rotation và license checking...")
 
 	stateManager := bp.autoCrawler.stateManager
 
@@ -324,20 +399,9 @@ func (bp *BatchProcessor) processAccountsBatch(accounts []models.Account) []stri
 	return validTokens
 }
 
-// processEmailsWithTokens processes emails with the given tokens
+// processEmailsWithTokens processes emails với license checking
 func (bp *BatchProcessor) processEmailsWithTokens(tokens []string) error {
-	if err := bp.initializeCrawler(tokens); err != nil {
-		return fmt.Errorf("failed to initialize crawler: %w", err)
-	}
-	defer func() {
-		crawlerInstance := bp.autoCrawler.GetCrawler()
-		if crawlerInstance != nil {
-			crawler.Close(crawlerInstance) // Use function instead of method
-			bp.autoCrawler.SetCrawler(nil)
-		}
-	}()
-
-	// Get remaining emails from SQLite
+	// STEP 1: Check license trước khi bắt đầu
 	stateManager := bp.autoCrawler.stateManager
 	remainingEmails := stateManager.GetRemainingEmails()
 
@@ -346,9 +410,28 @@ func (bp *BatchProcessor) processEmailsWithTokens(tokens []string) error {
 		return nil
 	}
 
+	// STEP 2: License check trước khi process
+	if err := bp.checkLicenseLimitsBeforeProcessing(len(remainingEmails)); err != nil {
+		bp.logError("❌ License limit exceeded before processing: %v", err)
+		return err
+	}
+
+	// STEP 3: Initialize crawler
+	if err := bp.initializeCrawler(tokens); err != nil {
+		return fmt.Errorf("failed to initialize crawler: %w", err)
+	}
+	defer func() {
+		crawlerInstance := bp.autoCrawler.GetCrawler()
+		if crawlerInstance != nil {
+			crawler.Close(crawlerInstance)
+			bp.autoCrawler.SetCrawler(nil)
+		}
+	}()
+
 	bp.logInfo("🎯 Tiếp tục crawl %d emails còn lại với %d tokens...", len(remainingEmails), len(tokens))
 
-	processedCount, err := bp.crawlWithCurrentTokens(remainingEmails)
+	// STEP 4: Process với license checking
+	processedCount, err := bp.crawlWithCurrentTokensAndLicenseCheck(remainingEmails)
 
 	bp.logSuccess("✅ Đã xử lý %d emails trong batch này", processedCount)
 	return err
@@ -375,16 +458,16 @@ func (bp *BatchProcessor) initializeCrawler(tokens []string) error {
 	return nil
 }
 
-// crawlWithCurrentTokens crawls emails with current tokens - NO CONSOLE OUTPUT
-func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
+// crawlWithCurrentTokensAndLicenseCheck - Enhanced version với license checking
+func (bp *BatchProcessor) crawlWithCurrentTokensAndLicenseCheck(emails []string) (int, error) {
 	if len(emails) == 0 {
 		return 0, nil
 	}
 
 	totalOriginalEmails := len(bp.autoCrawler.GetTotalEmails())
-
-	// Get stats from SQLite
 	emailStorage, _, _ := bp.autoCrawler.GetStorageServices()
+
+	// Get initial stats
 	stats, err := emailStorage.GetEmailStats()
 	if err != nil {
 		bp.logError("⚠️ Không thể lấy stats từ database: %v", err)
@@ -392,87 +475,54 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 	}
 
 	alreadyProcessed := stats["success"]
+	atomic.StoreInt32(&bp.processedEmailsCount, int32(alreadyProcessed))
+	atomic.StoreInt32(&bp.successEmailsCount, int32(stats["has_info"]+stats["no_info"]))
 
-	bp.logInfo("🎯 Bắt đầu crawl %d emails với tokens hiện tại...", len(emails))
-	bp.updateProgress(alreadyProcessed, totalOriginalEmails, "📊 Tiến độ tổng thể: Đã hoàn thành %d/%d emails (%.1f%%)", alreadyProcessed, totalOriginalEmails, float64(alreadyProcessed)*100/float64(totalOriginalEmails))
+	bp.logInfo("🎯 Bắt đầu crawl %d emails với license checking...", len(emails))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Reset stats cho batch này
+	// Reset crawler stats
 	crawlerInstance := bp.autoCrawler.GetCrawler()
 	if crawlerInstance != nil {
 		atomic.StoreInt32(&crawlerInstance.Stats.Processed, 0)
 		atomic.StoreInt32(&crawlerInstance.Stats.Success, 0)
 		atomic.StoreInt32(&crawlerInstance.Stats.Failed, 0)
-		atomic.StoreInt32(&crawlerInstance.Stats.TokenErrors, 0)
 		crawlerInstance.AllTokensFailed = false
 	}
 
 	emailCh := make(chan string, 100)
 	done := make(chan struct{})
 
-	// Status ticker - UPDATE GUI INSTEAD OF CONSOLE
+	// License check ticker - Kiểm tra license định kỳ
+	licenseCheckTicker := time.NewTicker(30 * time.Second) // Check every 30 seconds
+	go func() {
+		defer licenseCheckTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-licenseCheckTicker.C:
+				if err := bp.checkLicenseLimitsDuringProcessing(); err != nil {
+					bp.logError("❌ License limit exceeded during processing: %v", err)
+					cancel() // Stop crawling
+					return
+				}
+			}
+		}
+	}()
+
+	// Status ticker
 	statusTicker := time.NewTicker(2 * time.Second)
 	go func() {
 		defer statusTicker.Stop()
-
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-statusTicker.C:
-				// Check token status
-				allTokensFailed := false
-				validTokenCount := 0
-				totalTokens := 0
-				batchProcessed := int32(0)
-				batchSuccess := int32(0)
-				batchFailed := int32(0)
-				activeReqs := int32(0)
-
-				crawlerInstance := bp.autoCrawler.GetCrawler()
-				if crawlerInstance != nil {
-					allTokensFailed = crawlerInstance.AllTokensFailed
-					batchProcessed = atomic.LoadInt32(&crawlerInstance.Stats.Processed)
-					batchSuccess = atomic.LoadInt32(&crawlerInstance.Stats.Success)
-					batchFailed = atomic.LoadInt32(&crawlerInstance.Stats.Failed)
-					activeReqs = atomic.LoadInt32(&crawlerInstance.ActiveRequests)
-					totalTokens = len(crawlerInstance.Tokens)
-
-					// Count valid tokens
-					for _, token := range crawlerInstance.Tokens {
-						if !crawlerInstance.InvalidTokens[token] {
-							validTokenCount++
-						}
-					}
-				}
-
-				// If tokens failed, stop crawling to get new tokens
-				if allTokensFailed {
-					bp.logError("❌ Tất cả tokens đã hết hiệu lực, cần lấy tokens mới")
-					cancel() // Stop current crawling
-					return
-				}
-
-				// Get current stats from SQLite
-				currentStats, err := emailStorage.GetEmailStats()
-				if err != nil {
-					currentStats = make(map[string]int)
-				}
-
-				batchPercent := 0.0
-				if len(emails) > 0 {
-					batchPercent = float64(batchProcessed) * 100 / float64(len(emails))
-				}
-
-				totalPercent := float64(currentStats["success"]) * 100 / float64(totalOriginalEmails)
-
-				// UPDATE GUI PROGRESS - NO CONSOLE OUTPUT
-				bp.updateProgress(int(batchProcessed), len(emails),
-					"🔄 Batch: %.1f%% (%d/%d) | Success: %d | Failed: %d | Active: %d | Tokens: %d/%d | Total: %.1f%% (%d/%d)",
-					batchPercent, batchProcessed, len(emails), batchSuccess, batchFailed, activeReqs, validTokenCount, totalTokens,
-					totalPercent, currentStats["success"], totalOriginalEmails)
+				bp.updateProgressWithLicenseInfo(ctx, emailStorage, totalOriginalEmails, len(emails))
 			}
 		}
 	}()
@@ -489,7 +539,7 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 		}
 	}()
 
-	// Consumer goroutines
+	// Consumer goroutines với license checking
 	go func() {
 		defer close(done)
 		var wg sync.WaitGroup
@@ -511,22 +561,28 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 						return
 					}
 
-					// Check tokens before processing email
+					// LICENSE CHECK: Kiểm tra trước khi process từng email
+					if err := bp.checkLicenseLimitsDuringProcessing(); err != nil {
+						bp.logError("❌ License limit reached, stopping processing: %v", err)
+						cancel()
+						return
+					}
+
+					// Process email
 					crawlerInstance := bp.autoCrawler.GetCrawler()
 					if crawlerInstance != nil {
-						allTokensFailed := crawlerInstance.AllTokensFailed
-						if allTokensFailed {
-							bp.logError("❌ Tokens hết hiệu lực trong quá trình crawl, dừng worker")
+						if crawlerInstance.AllTokensFailed {
+							bp.logError("❌ Tokens hết hiệu lực, dừng worker")
 							cancel()
 							return
 						}
 
 						atomic.AddInt32(&crawlerInstance.Stats.Processed, 1)
-						success := bp.retryEmailWithSQLite(email, 5)
+						atomic.AddInt32(&bp.processedEmailsCount, 1)
 
-						if !success {
-							// LOG TO GUI INSTEAD OF autoCrawler.LogLine
-							bp.logError("💾 Email %s thất bại sau 5 lần retry - đánh dấu failed trong DB", email)
+						success := bp.retryEmailWithLicenseCheck(email, 5)
+						if success {
+							atomic.AddInt32(&bp.successEmailsCount, 1)
 						}
 					}
 				}
@@ -538,6 +594,7 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 	// Wait for completion
 	select {
 	case <-done:
+		licenseCheckTicker.Stop()
 		statusTicker.Stop()
 
 		processed := int32(0)
@@ -552,15 +609,16 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 
 		bp.logSuccess("✅ Hoàn thành batch: Processed: %d | Success: %d | Failed: %d", processed, success, failed)
 
-		// Get final stats from SQLite
-		finalStats, err := emailStorage.GetEmailStats()
-		if err == nil {
-			bp.logInfo("📊 Current totals: ✅Data: %d | 📭NoData: %d", finalStats["has_info"], finalStats["no_info"])
+		// Final license check
+		finalErr := bp.checkLicenseLimitsDuringProcessing()
+		if finalErr != nil {
+			bp.logWarning("⚠️ License limit reached at end of batch: %v", finalErr)
 		}
 
 		return int(processed), nil
 
 	case <-ctx.Done():
+		licenseCheckTicker.Stop()
 		statusTicker.Stop()
 
 		processed := int32(0)
@@ -570,12 +628,57 @@ func (bp *BatchProcessor) crawlWithCurrentTokens(emails []string) (int, error) {
 		}
 
 		if atomic.LoadInt32(bp.autoCrawler.GetShutdownRequested()) == 1 {
-			bp.logWarning("⚠️ Crawling bị dừng do Ctrl+C: Đã xử lý %d emails", processed)
+			bp.logWarning("⚠️ Crawling stopped by user: Processed %d emails", processed)
 		} else {
-			bp.logInfo("🔄 Crawling tạm dừng để lấy tokens mới: Đã xử lý %d emails", processed)
+			bp.logInfo("🔄 Crawling stopped by license limit or tokens: Processed %d emails", processed)
 		}
 		return int(processed), ctx.Err()
 	}
+}
+
+// updateProgressWithLicenseInfo cập nhật progress với thông tin license
+func (bp *BatchProcessor) updateProgressWithLicenseInfo(ctx context.Context, emailStorage *storage.EmailStorage, totalOriginalEmails, currentBatchSize int) {
+	// Get current stats
+	currentStats, err := emailStorage.GetEmailStats()
+	if err != nil {
+		currentStats = make(map[string]int)
+	}
+
+	// Get license info
+	licenseInfo := ""
+	if bp.licenseWrapper != nil {
+		info := bp.licenseWrapper.GetLicenseInfo()
+		if maxEmails, ok := info["max_emails"].(int); ok && maxEmails > 0 {
+			successCount := currentStats["success"]
+			licenseInfo = fmt.Sprintf(" | License: %d/%d", successCount, maxEmails)
+		} else {
+			licenseInfo = " | License: Unlimited"
+		}
+	}
+
+	batchPercent := 0.0
+	if currentBatchSize > 0 {
+		batchProcessed := atomic.LoadInt32(&bp.processedEmailsCount)
+		batchPercent = float64(batchProcessed) * 100 / float64(currentBatchSize)
+	}
+
+	totalPercent := float64(currentStats["success"]) * 100 / float64(totalOriginalEmails)
+
+	bp.updateProgress(int(atomic.LoadInt32(&bp.processedEmailsCount)), currentBatchSize,
+		"🔄 Batch: %.1f%% | Total: %.1f%% | Success: %d | Failed: %d%s",
+		batchPercent, totalPercent, currentStats["success"], currentStats["failed"], licenseInfo)
+}
+
+// retryEmailWithLicenseCheck - Enhanced retry với license checking
+func (bp *BatchProcessor) retryEmailWithLicenseCheck(email string, maxRetries int) bool {
+	// License check trước khi retry
+	if err := bp.checkLicenseLimitsDuringProcessing(); err != nil {
+		bp.logError("❌ License limit reached, skipping email: %s (%v)", email, err)
+		return false
+	}
+
+	// Proceed với regular retry logic
+	return bp.retryEmailWithSQLite(email, maxRetries)
 }
 
 // retryEmailWithSQLite retries email with SQLite integration - GUI LOGGING
@@ -592,9 +695,7 @@ func (bp *BatchProcessor) retryEmailWithSQLite(email string, maxRetries int) boo
 		if crawlerInstance != nil {
 			allTokensFailed := crawlerInstance.AllTokensFailed
 			if allTokensFailed {
-				// LOG TO GUI INSTEAD OF autoCrawler.LogLine
 				bp.logError("❌ Tất cả tokens đã bị lỗi, dừng retry cho email: %s", email)
-				// Update status to failed in SQLite
 				emailStorage.UpdateEmailStatus(email, storage.StatusFailed, false, false)
 				return false
 			}
@@ -602,8 +703,6 @@ func (bp *BatchProcessor) retryEmailWithSQLite(email string, maxRetries int) boo
 			reqCtx, reqCancel := context.WithTimeout(context.Background(), config.RequestTimeout)
 			hasProfile, body, statusCode, _ := bp.queryService.QueryProfileWithRetryLogic(crawlerInstance, reqCtx, email)
 			reqCancel()
-
-			// Log attempt TO GUI
 
 			// Only log detailed info on final attempt or success
 			if attempt == maxRetries || statusCode == 200 {
@@ -674,4 +773,93 @@ func (bp *BatchProcessor) retryEmailWithSQLite(email string, maxRetries int) boo
 		atomic.AddInt32(&crawlerInstance.Stats.Failed, 1)
 	}
 	return false
+}
+
+// GetLicenseStats returns current license usage statistics
+func (bp *BatchProcessor) GetLicenseStats() map[string]interface{} {
+	if bp.licenseWrapper == nil {
+		return map[string]interface{}{
+			"license_active": false,
+			"error":          "license not initialized",
+		}
+	}
+
+	info := bp.licenseWrapper.GetLicenseInfo()
+	currentProcessed := atomic.LoadInt32(&bp.processedEmailsCount)
+	currentSuccess := atomic.LoadInt32(&bp.successEmailsCount)
+
+	stats := map[string]interface{}{
+		"license_active":    true,
+		"current_processed": int(currentProcessed),
+		"current_success":   int(currentSuccess),
+		"license_info":      info,
+	}
+
+	return stats
+}
+
+// UpdateLicenseUsage updates license usage counters (called externally)
+func (bp *BatchProcessor) UpdateLicenseUsage(processed, success int) {
+	atomic.StoreInt32(&bp.processedEmailsCount, int32(processed))
+	atomic.StoreInt32(&bp.successEmailsCount, int32(success))
+
+	// Also update license wrapper
+	if bp.licenseWrapper != nil {
+		bp.licenseWrapper.UpdateUsageCounters(processed, success)
+	}
+}
+
+// ResetLicenseCounters resets license usage counters
+func (bp *BatchProcessor) ResetLicenseCounters() {
+	atomic.StoreInt32(&bp.processedEmailsCount, 0)
+	atomic.StoreInt32(&bp.successEmailsCount, 0)
+
+	if bp.licenseWrapper != nil {
+		bp.licenseWrapper.ResetUsageCounters()
+	}
+}
+
+// GetCurrentUsage returns current usage statistics
+func (bp *BatchProcessor) GetCurrentUsage() (processed, success int) {
+	return int(atomic.LoadInt32(&bp.processedEmailsCount)), int(atomic.LoadInt32(&bp.successEmailsCount))
+}
+
+// IsLicenseValid checks if license is currently valid
+func (bp *BatchProcessor) IsLicenseValid() bool {
+	if bp.licenseWrapper == nil {
+		return false
+	}
+
+	err := bp.licenseWrapper.ValidateAndStart()
+	return err == nil
+}
+
+// GetRemainingEmailQuota returns remaining email quota based on license
+func (bp *BatchProcessor) GetRemainingEmailQuota() int {
+	if bp.licenseWrapper == nil {
+		return 0
+	}
+
+	info := bp.licenseWrapper.GetLicenseInfo()
+	maxEmails, ok := info["max_emails"].(int)
+	if !ok || maxEmails <= 0 {
+		return -1 // Unlimited
+	}
+
+	currentProcessed := atomic.LoadInt32(&bp.processedEmailsCount)
+	remaining := maxEmails - int(currentProcessed)
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	return remaining
+}
+
+// ShowLicenseStatus displays current license status (for debugging)
+func (bp *BatchProcessor) ShowLicenseStatus() {
+	if bp.licenseWrapper != nil {
+		bp.licenseWrapper.ShowLicenseStatus()
+	} else {
+		bp.logError("License wrapper not initialized")
+	}
 }
