@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -20,6 +19,7 @@ import (
 	"linkedin-crawler/internal/config"
 	"linkedin-crawler/internal/orchestrator"
 	storageInternal "linkedin-crawler/internal/storage"
+	"linkedin-crawler/internal/utils"
 )
 
 type EmailsTab struct {
@@ -48,13 +48,19 @@ type EmailsTab struct {
 	isCrawling  int32 // atomic flag
 	crawlCancel context.CancelFunc
 	autoCrawler *orchestrator.AutoCrawler
+
+	// Email status cache để tránh query database liên tục
+	emailStatusCache map[string]string
+	lastCacheUpdate  time.Time
 }
 
 func NewEmailsTab(gui *CrawlerGUI) *EmailsTab {
 	tab := &EmailsTab{
-		gui:       gui,
-		emails:    []string{},
-		emailData: binding.NewStringList(),
+		gui:              gui,
+		emails:           []string{},
+		emailData:        binding.NewStringList(),
+		emailStatusCache: make(map[string]string),
+		lastCacheUpdate:  time.Time{},
 	}
 
 	tab.importBtn = widget.NewButtonWithIcon("Import", theme.FolderOpenIcon(), tab.ImportEmails)
@@ -152,8 +158,12 @@ func (et *EmailsTab) setupEmailsList() {
 			emailLabel := infoContainer.Objects[0].(*widget.Label)
 			statusLabel := infoContainer.Objects[1].(*widget.Label)
 			emailLabel.SetText(str)
+
+			// Get real status from database with caching
 			status := et.getEmailStatus(str)
 			statusLabel.SetText(status)
+
+			// Set appropriate icon based on status
 			switch status {
 			case "Pending":
 				icon.SetResource(theme.MailSendIcon())
@@ -225,7 +235,12 @@ func (et *EmailsTab) StartCrawl() {
 				et.startCrawlBtn.Enable()
 				et.stopCrawlBtn.Disable()
 				et.addLog("✅ Email crawling hoàn thành!")
-				et.updateStats() // Update final stats
+				// Clear cache to force refresh
+				et.clearEmailStatusCache()
+				// Update stats from database after completion
+				et.updateStatsFromDatabase()
+				// Refresh email list to show updated statuses
+				et.emailsList.Refresh()
 			}
 		}()
 
@@ -261,6 +276,103 @@ func (et *EmailsTab) StopCrawl() {
 	et.stopCrawlBtn.Disable()
 
 	et.addLog("🛑 Đã dừng email crawling!")
+
+	// Clear cache and update stats from database after stopping
+	et.clearEmailStatusCache()
+	et.updateStatsFromDatabase()
+	et.emailsList.Refresh()
+}
+
+// Clear email status cache
+func (et *EmailsTab) clearEmailStatusCache() {
+	et.emailStatusCache = make(map[string]string)
+	et.lastCacheUpdate = time.Time{}
+}
+
+// Update email status cache from database
+func (et *EmailsTab) updateEmailStatusCache() {
+	// Only update cache every 5 seconds to avoid excessive database queries
+	if time.Since(et.lastCacheUpdate) < 5*time.Second {
+		return
+	}
+
+	emailStorage := storageInternal.NewEmailStorage()
+	if err := emailStorage.InitDB(); err != nil {
+		et.addLog(fmt.Sprintf("⚠️ Cache update: Không thể kết nối database: %v", err))
+		return
+	}
+	defer emailStorage.CloseDB()
+
+	// Get all email records from database
+	query := `SELECT email, status, has_info, no_info FROM emails`
+	db := emailStorage.GetDB()
+	if db == nil {
+		et.addLog("⚠️ Cache update: Database connection không khả dụng")
+		return
+	}
+
+	rows, err := db.Query(query)
+	if err != nil {
+		et.addLog(fmt.Sprintf("⚠️ Cache update: Lỗi query database: %v", err))
+		return
+	}
+	defer rows.Close()
+
+	newCache := make(map[string]string)
+	for rows.Next() {
+		var email, status string
+		var hasInfo, noInfo bool
+
+		if err := rows.Scan(&email, &status, &hasInfo, &noInfo); err != nil {
+			continue
+		}
+
+		// Convert database status to display status
+		switch status {
+		case "pending":
+			newCache[email] = "Pending"
+		case "success":
+			if hasInfo {
+				newCache[email] = "Success - Has LinkedIn"
+			} else {
+				newCache[email] = "Success - No LinkedIn"
+			}
+		case "failed":
+			newCache[email] = "Failed"
+		default:
+			newCache[email] = "Unknown"
+		}
+	}
+
+	et.emailStatusCache = newCache
+	et.lastCacheUpdate = time.Now()
+	et.addLog(fmt.Sprintf("🔄 Updated status cache for %d emails", len(newCache)))
+}
+
+// Get email status with database lookup and caching
+func (et *EmailsTab) getEmailStatus(email string) string {
+	// If we have crawler running, get live status
+	if et.autoCrawler != nil {
+		emailStorage, _, _ := et.autoCrawler.GetStorageServices()
+		if emailStorage != nil {
+			// Try to get status from running crawler's database
+			if status, ok := et.emailStatusCache[email]; ok {
+				return status
+			}
+			return "Processing"
+		}
+	}
+
+	// Update cache if needed
+	et.updateEmailStatusCache()
+
+	// Return cached status if available
+	if status, ok := et.emailStatusCache[email]; ok {
+		return status
+	}
+
+	// Default to Pending if not found in cache
+	return "Pending"
 }
 
 // checkTokensAvailability checks if tokens are available, fallback to accounts
@@ -300,15 +412,8 @@ func (et *EmailsTab) hasValidTokensFile() bool {
 
 	et.addLog(fmt.Sprintf("🔍 Tìm thấy %d tokens trong file tokens.txt", len(tokens)))
 
-	// Quick validation - check if tokens look valid (basic format check)
-	validCount := 0
-	for _, token := range tokens {
-		token = strings.TrimSpace(token)
-		// Basic token format validation (should be long alphanumeric string)
-		if len(token) > 50 && et.isAlphanumericToken(token) {
-			validCount++
-		}
-	}
+	// Use utils package for validation
+	validCount, _ := utils.ValidateTokenBatch(tokens)
 
 	if validCount == 0 {
 		et.addLog("⚠️ Không có tokens nào có format hợp lệ trong file")
@@ -317,14 +422,6 @@ func (et *EmailsTab) hasValidTokensFile() bool {
 
 	et.addLog(fmt.Sprintf("✅ Có %d/%d tokens có format hợp lệ", validCount, len(tokens)))
 	return validCount > 0
-}
-
-// isAlphanumericToken checks if token has valid format
-func (et *EmailsTab) isAlphanumericToken(token string) bool {
-	// Basic check for token format - should contain alphanumeric and some special chars
-	// LinkedIn tokens typically contain letters, numbers, dots, underscores, and hyphens
-	matched, _ := regexp.MatchString(`^[A-Za-z0-9._-]+$`, token)
-	return matched
 }
 
 // logTokenAccountStatus logs the current token and account status
@@ -398,6 +495,10 @@ func (et *EmailsTab) performEmailCrawling(ctx context.Context) {
 	// Show final results
 	et.gui.updateUI <- func() {
 		et.showFinalResults()
+		// Clear cache and update stats from database after completion
+		et.clearEmailStatusCache()
+		et.updateStatsFromDatabase()
+		et.emailsList.Refresh()
 	}
 }
 
@@ -414,6 +515,8 @@ func (et *EmailsTab) monitorCrawlProgress(ctx context.Context) {
 			if et.autoCrawler != nil {
 				et.gui.updateUI <- func() {
 					et.updateStatsFromCrawler()
+					// Clear cache periodically during crawling to get fresh data
+					et.clearEmailStatusCache()
 				}
 			}
 		}
@@ -454,6 +557,46 @@ func (et *EmailsTab) updateStatsFromCrawler() {
 			}
 		}
 	}
+}
+
+// Update stats from database when not crawling with better logging
+func (et *EmailsTab) updateStatsFromDatabase() {
+	et.addLog("🔍 Đang cập nhật stats từ database...")
+
+	// Try to get stats from database directly
+	emailStorage := storageInternal.NewEmailStorage()
+
+	// Initialize database connection
+	if err := emailStorage.InitDB(); err != nil {
+		et.addLog(fmt.Sprintf("⚠️ Lỗi kết nối database: %v - fallback to default stats", err))
+		et.updateStatsDefault()
+		return
+	}
+	defer emailStorage.CloseDB()
+
+	stats, err := emailStorage.GetEmailStats()
+	if err != nil {
+		et.addLog(fmt.Sprintf("⚠️ Lỗi lấy stats từ database: %v - fallback to default stats", err))
+		// Fallback to default stats
+		et.updateStatsDefault()
+		return
+	}
+
+	total := len(et.emails)
+	pending := stats["pending"]
+	success := stats["success"]
+	failed := stats["failed"]
+	hasInfo := stats["has_info"]
+	noInfo := stats["no_info"]
+
+	et.totalLabel.SetText(fmt.Sprintf("Total: %d", total))
+	et.pendingLabel.SetText(fmt.Sprintf("Pending: %d", pending))
+	et.successLabel.SetText(fmt.Sprintf("Success: %d", success))
+	et.failedLabel.SetText(fmt.Sprintf("Failed: %d", failed))
+	et.hasInfoLabel.SetText(fmt.Sprintf("Has LinkedIn: %d", hasInfo))
+	et.noInfoLabel.SetText(fmt.Sprintf("No LinkedIn: %d", noInfo))
+
+	et.addLog(fmt.Sprintf("✅ Cập nhật stats từ database: Success: %d | Failed: %d | LinkedIn: %d", success, failed, hasInfo))
 }
 
 // showFinalResults shows final crawling results
@@ -512,6 +655,7 @@ func (et *EmailsTab) addLog(msg string) {
 	et.logText.ParseMarkdown(displayText)
 }
 
+// IMPROVED: Import emails with better comma-separated handling using utils
 func (et *EmailsTab) ImportEmails() {
 	dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
 		if err != nil || reader == nil {
@@ -531,52 +675,76 @@ func (et *EmailsTab) ImportEmails() {
 			}
 			return
 		}
+
 		lines := strings.Split(string(content), "\n")
-		imported := 0
-		skipped := 0
+		var allEmailsFromFile []string
+
+		// Extract all emails from all lines using utils
 		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			email := line
-			if strings.Contains(line, ",") {
-				parts := strings.Split(line, ",")
-				for _, part := range parts {
-					part = strings.TrimSpace(part)
-					if et.isValidEmail(part) {
-						email = part
-						break
-					}
-				}
-			}
-			if !et.isValidEmail(email) {
-				continue
-			}
+			emailsFromLine := utils.ExtractEmailsFromLine(line)
+			allEmailsFromFile = append(allEmailsFromFile, emailsFromLine...)
+		}
+
+		// Remove duplicates from file content
+		allEmailsFromFile = utils.RemoveDuplicateEmails(allEmailsFromFile)
+
+		// Check for duplicates with existing emails
+		var newEmails []string
+		duplicateSkipped := 0
+
+		for _, email := range allEmailsFromFile {
 			exists := false
+			normalizedEmail := utils.NormalizeEmail(email)
+
 			for _, existingEmail := range et.emails {
-				if existingEmail == email {
+				if utils.NormalizeEmail(existingEmail) == normalizedEmail {
 					exists = true
-					skipped++
+					duplicateSkipped++
 					break
 				}
 			}
+
 			if !exists {
-				et.emails = append(et.emails, email)
-				et.emailData.Append(email)
-				imported++
+				newEmails = append(newEmails, email)
 			}
 		}
+
+		// Add new emails
+		for _, email := range newEmails {
+			et.emails = append(et.emails, email)
+			et.emailData.Append(email)
+		}
+
+		imported := len(newEmails)
+
 		et.gui.updateUI <- func() {
+			// Ensure emails and emailData are synchronized
+			et.syncEmailsAndData()
 			et.updateStats()
-			message := fmt.Sprintf("Imported: %d | Skipped: %d", imported, skipped)
+			message := fmt.Sprintf("Imported: %d new emails | Duplicates skipped: %d | Total from file: %d",
+				imported, duplicateSkipped, len(allEmailsFromFile))
 			dialog.ShowInformation("Import Results", message, et.gui.window)
 			et.gui.updateStatus(fmt.Sprintf("Imported %d emails", imported))
-			et.addLog(fmt.Sprintf("📥 Import: %d emails thành công, %d bị bỏ qua", imported, skipped))
+			et.addLog(fmt.Sprintf("📥 Import: %d emails thành công, %d duplicates bị bỏ qua", imported, duplicateSkipped))
+
+			// Clear cache after import
+			et.clearEmailStatusCache()
+			et.emailsList.Refresh()
 		}
 	}, et.gui.window)
 }
 
+// Synchronize emails and emailData to ensure consistency
+func (et *EmailsTab) syncEmailsAndData() {
+	// Rebuild emailData from emails to ensure sync
+	et.emailData = binding.NewStringList()
+	for _, email := range et.emails {
+		et.emailData.Append(email)
+	}
+	et.setupEmailsList()
+}
+
+// IMPROVED: Clear all emails with better synchronization
 func (et *EmailsTab) ClearAllEmails() {
 	if len(et.emails) == 0 {
 		return
@@ -585,9 +753,11 @@ func (et *EmailsTab) ClearAllEmails() {
 		fmt.Sprintf("Remove all %d emails?", len(et.emails)),
 		func(confirmed bool) {
 			if confirmed {
+				// Clear both emails and emailData, then sync
 				et.emails = []string{}
 				et.emailData = binding.NewStringList()
 				et.setupEmailsList()
+				et.clearEmailStatusCache()
 				et.updateStats()
 				et.gui.updateUI <- func() {
 					et.gui.updateStatus("Cleared all emails")
@@ -612,17 +782,24 @@ example@example.com
 		}
 		return
 	}
+
+	// Clear and rebuild both emails and emailData
 	et.emails = []string{}
 	et.emailData = binding.NewStringList()
 	et.setupEmailsList()
+
 	for _, email := range emails {
 		et.emails = append(et.emails, email)
 		et.emailData.Append(email)
 	}
+
+	// Clear cache after loading
+	et.clearEmailStatusCache()
 	et.updateStats()
 	et.gui.updateUI <- func() {
 		et.gui.updateStatus(fmt.Sprintf("Loaded %d emails", len(emails)))
 		et.addLog(fmt.Sprintf("📂 Loaded %d emails từ file", len(emails)))
+		et.emailsList.Refresh()
 	}
 }
 
@@ -652,22 +829,8 @@ func (et *EmailsTab) SaveEmails() {
 
 func (et *EmailsTab) RefreshEmailsList() {
 	et.LoadEmails()
-}
-
-func (et *EmailsTab) isValidEmail(email string) bool {
-	emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
-	return emailRegex.MatchString(email)
-}
-
-func (et *EmailsTab) getEmailStatus(email string) string {
-	if et.autoCrawler != nil {
-		emailStorage, _, _ := et.autoCrawler.GetStorageServices()
-		if emailStorage != nil {
-			// Try to get status from database
-			return "Processing"
-		}
-	}
-	return "Pending"
+	// Also update stats from database when refreshing
+	et.updateStatsFromDatabase()
 }
 
 func (et *EmailsTab) updateStats() {
@@ -695,7 +858,15 @@ func (et *EmailsTab) updateStats() {
 		}
 	}
 
-	// Default stats when not crawling
+	// Try to get stats from database when not crawling with logging
+	et.addLog("🔍 Crawler không chạy, lấy stats từ database...")
+	et.updateStatsFromDatabase()
+}
+
+// Default stats when database is not available with logging
+func (et *EmailsTab) updateStatsDefault() {
+	et.addLog("📊 Sử dụng default stats (database không khả dụng)")
+	total := len(et.emails)
 	et.totalLabel.SetText(fmt.Sprintf("Total: %d", total))
 	et.pendingLabel.SetText(fmt.Sprintf("Pending: %d", total))
 	et.successLabel.SetText(fmt.Sprintf("Success: %d", 0))

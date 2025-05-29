@@ -37,6 +37,12 @@ type AccountsTab struct {
 	usedLabel      *widget.Label
 	remainingLabel *widget.Label
 
+	// Token info labels replacing quick actions
+	validTokensLabel   *widget.Label
+	invalidTokensLabel *widget.Label
+	totalTokensLabel   *widget.Label
+	lastUpdateLabel    *widget.Label
+
 	logText   *widget.RichText
 	logBuffer []string
 
@@ -46,6 +52,9 @@ type AccountsTab struct {
 	isTokenExtracting  int32 // atomic flag
 	tokenExtractCancel context.CancelFunc
 	tokenExtractor     *auth.TokenExtractor
+
+	// Token info refresh ticker
+	tokenInfoTicker *time.Ticker
 }
 
 func NewAccountsTab(gui *CrawlerGUI) *AccountsTab {
@@ -73,7 +82,17 @@ func NewAccountsTab(gui *CrawlerGUI) *AccountsTab {
 	tab.usedLabel = widget.NewLabel("Used: 0")
 	tab.remainingLabel = widget.NewLabel("Available: 0")
 
+	// Initialize token info labels
+	tab.validTokensLabel = widget.NewLabel("Valid Tokens: 0")
+	tab.invalidTokensLabel = widget.NewLabel("Invalid Tokens: 0")
+	tab.totalTokensLabel = widget.NewLabel("Total Tokens: 0")
+	tab.lastUpdateLabel = widget.NewLabel("Last Update: Never")
+
 	tab.setupAccountsList()
+
+	// Start token info refresh ticker
+	tab.startTokenInfoRefresh()
+
 	return tab
 }
 
@@ -92,16 +111,25 @@ func (at *AccountsTab) CreateContent() fyne.CanvasObject {
 		at.remainingLabel,
 	)
 
-	actionsButtons := container.NewHBox(
-		widget.NewButton("Validate All", at.ValidateAllAccounts),
-		widget.NewButton("Remove Failed", at.RemoveFailedAccounts),
-		widget.NewButton("Export Valid", at.ExportValidAccounts),
+	// Token info grid replacing quick actions
+	tokenInfoGrid := container.NewVBox(
+		container.NewHBox(
+			at.validTokensLabel,
+			widget.NewSeparator(),
+			at.invalidTokensLabel,
+		),
+		container.NewHBox(
+			at.totalTokensLabel,
+			widget.NewSeparator(),
+			at.lastUpdateLabel,
+		),
+		widget.NewButton("Refresh Token Info", at.RefreshTokenInfo),
 	)
 
 	leftPanel := container.NewVBox(
 		widget.NewCard("File Operations", "", fileButtons),
 		widget.NewCard("Statistics", "", statsGrid),
-		widget.NewCard("Quick Actions", "", actionsButtons),
+		widget.NewCard("Token Information", "", tokenInfoGrid), // Replaced Quick Actions
 		container.NewScroll(at.accountsList),
 	)
 
@@ -171,6 +199,112 @@ func (at *AccountsTab) setupAccountsList() {
 	at.selectedIndex = -1
 }
 
+// Start token info refresh ticker
+func (at *AccountsTab) startTokenInfoRefresh() {
+	if at.tokenInfoTicker != nil {
+		at.tokenInfoTicker.Stop()
+	}
+
+	at.tokenInfoTicker = time.NewTicker(10 * time.Second) // Update every 10 seconds
+	go func() {
+		// Initial update
+		at.gui.updateUI <- func() {
+			at.updateTokenInfo()
+		}
+
+		defer func() {
+			if at.tokenInfoTicker != nil {
+				at.tokenInfoTicker.Stop()
+			}
+		}()
+
+		for {
+			select {
+			case <-at.tokenInfoTicker.C:
+				at.gui.updateUI <- func() {
+					at.updateTokenInfo()
+				}
+			case <-at.gui.ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// Update token information from tokens.txt file
+func (at *AccountsTab) updateTokenInfo() {
+	tokenStorage := storageInternal.NewTokenStorage()
+	tokens, err := tokenStorage.LoadTokensFromFile("tokens.txt")
+
+	if err != nil {
+		// No tokens file or error reading
+		at.validTokensLabel.SetText("Valid Tokens: 0")
+		at.invalidTokensLabel.SetText("Invalid Tokens: 0")
+		at.totalTokensLabel.SetText("Total Tokens: 0")
+		at.lastUpdateLabel.SetText("Last Update: No tokens file")
+		return
+	}
+
+	totalTokens := len(tokens)
+	validTokens := 0
+	invalidTokens := 0
+
+	// Basic validation - check token format
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if len(token) > 50 && at.isValidTokenFormat(token) {
+			validTokens++
+		} else {
+			invalidTokens++
+		}
+	}
+
+	// Update labels
+	at.validTokensLabel.SetText(fmt.Sprintf("Valid Tokens: %d", validTokens))
+	at.invalidTokensLabel.SetText(fmt.Sprintf("Invalid Tokens: %d", invalidTokens))
+	at.totalTokensLabel.SetText(fmt.Sprintf("Total Tokens: %d", totalTokens))
+	at.lastUpdateLabel.SetText(fmt.Sprintf("Last Update: %s", time.Now().Format("15:04:05")))
+
+	// Change label colors based on token availability
+	if validTokens > 10 {
+		at.validTokensLabel.Importance = widget.SuccessImportance
+	} else if validTokens > 5 {
+		at.validTokensLabel.Importance = widget.WarningImportance
+	} else if validTokens > 0 {
+		at.validTokensLabel.Importance = widget.MediumImportance
+	} else {
+		at.validTokensLabel.Importance = widget.DangerImportance
+	}
+
+	if invalidTokens > 0 {
+		at.invalidTokensLabel.Importance = widget.WarningImportance
+	} else {
+		at.invalidTokensLabel.Importance = widget.LowImportance
+	}
+
+	if totalTokens > 15 {
+		at.totalTokensLabel.Importance = widget.SuccessImportance
+	} else if totalTokens > 5 {
+		at.totalTokensLabel.Importance = widget.MediumImportance
+	} else {
+		at.totalTokensLabel.Importance = widget.LowImportance
+	}
+}
+
+// Manual refresh token info
+func (at *AccountsTab) RefreshTokenInfo() {
+	at.updateTokenInfo()
+	at.addLog("🔄 Đã refresh thông tin tokens")
+}
+
+// Check if token has valid format
+func (at *AccountsTab) isValidTokenFormat(token string) bool {
+	// Basic check for token format - should contain alphanumeric and some special chars
+	// LinkedIn tokens typically contain letters, numbers, dots, underscores, and hyphens
+	matched, _ := regexp.MatchString(`^[A-Za-z0-9._-]+$`, token)
+	return matched && len(token) > 50
+}
+
 // START TOKEN EXTRACT - Hoạt động thực tế
 func (at *AccountsTab) StartTokenExtract() {
 	// Check if already running
@@ -207,6 +341,8 @@ func (at *AccountsTab) StartTokenExtract() {
 				at.startTokenBtn.Enable()
 				at.stopTokenBtn.Disable()
 				at.addLog("✅ Token extraction hoàn thành!")
+				// Update token info after extraction
+				at.updateTokenInfo()
 			}
 		}()
 
@@ -234,6 +370,8 @@ func (at *AccountsTab) StopTokenExtract() {
 	at.stopTokenBtn.Disable()
 
 	at.addLog("🛑 Đã dừng token extraction!")
+	// Update token info after stopping
+	at.updateTokenInfo()
 }
 
 // performTokenExtraction thực hiện việc extract tokens
@@ -294,6 +432,8 @@ func (at *AccountsTab) performTokenExtraction(ctx context.Context) {
 			} else {
 				at.gui.updateUI <- func() {
 					at.addLog(fmt.Sprintf("💾 Đã lưu %d tokens vào file", len(validTokens)))
+					// Update token info immediately after saving
+					at.updateTokenInfo()
 				}
 			}
 		}
@@ -324,6 +464,9 @@ func (at *AccountsTab) performTokenExtraction(ctx context.Context) {
 		if successCount > 0 {
 			at.addLog("✅ Có thể bắt đầu crawl emails với tokens đã có!")
 		}
+
+		// Final update of token info
+		at.updateTokenInfo()
 	}
 }
 
@@ -469,103 +612,8 @@ func (at *AccountsTab) SaveAccounts() {
 
 func (at *AccountsTab) RefreshAccountsList() {
 	at.LoadAccounts()
-}
-
-func (at *AccountsTab) ValidateAllAccounts() {
-	if len(at.accounts) == 0 {
-		at.gui.updateUI <- func() {
-			dialog.ShowInformation("No Accounts", "No accounts to validate", at.gui.window)
-		}
-		return
-	}
-	valid := 0
-	invalid := 0
-	for _, account := range at.accounts {
-		if len(account.Password) >= 6 && at.isValidEmail(account.Email) {
-			valid++
-		} else {
-			invalid++
-		}
-	}
-	message := fmt.Sprintf("Valid: %d | Invalid: %d", valid, invalid)
-	at.gui.updateUI <- func() {
-		dialog.ShowInformation("Validation Results", message, at.gui.window)
-		at.gui.updateStatus(fmt.Sprintf("Validated %d accounts", len(at.accounts)))
-		at.addLog(fmt.Sprintf("✅ Validation: %d valid, %d invalid accounts", valid, invalid))
-	}
-}
-
-func (at *AccountsTab) RemoveFailedAccounts() {
-	originalCount := len(at.accounts)
-	validAccounts := []models.Account{}
-	for _, account := range at.accounts {
-		if len(account.Password) >= 6 && at.isValidEmail(account.Email) {
-			validAccounts = append(validAccounts, account)
-		}
-	}
-	removedCount := originalCount - len(validAccounts)
-	if removedCount > 0 {
-		dialog.ShowConfirm("Remove Failed",
-			fmt.Sprintf("Remove %d failed accounts?", removedCount),
-			func(confirmed bool) {
-				if confirmed {
-					at.accounts = validAccounts
-					at.accountData = binding.NewStringList()
-					for _, account := range at.accounts {
-						at.accountData.Append(fmt.Sprintf("%s|%s", account.Email, account.Password))
-					}
-					at.gui.updateUI <- func() {
-						at.accountsList.Refresh()
-						at.updateStats()
-						at.gui.updateStatus(fmt.Sprintf("Removed %d failed accounts", removedCount))
-						at.addLog(fmt.Sprintf("🗑️ Removed %d failed accounts", removedCount))
-					}
-				}
-			}, at.gui.window)
-	} else {
-		at.gui.updateUI <- func() {
-			dialog.ShowInformation("No Failed Accounts", "All accounts are valid", at.gui.window)
-		}
-	}
-}
-
-func (at *AccountsTab) ExportValidAccounts() {
-	validAccounts := []models.Account{}
-	for _, account := range at.accounts {
-		if len(account.Password) >= 6 && at.isValidEmail(account.Email) {
-			validAccounts = append(validAccounts, account)
-		}
-	}
-	if len(validAccounts) == 0 {
-		at.gui.updateUI <- func() {
-			dialog.ShowInformation("No Valid Accounts", "No valid accounts found", at.gui.window)
-		}
-		return
-	}
-	dialog.ShowFileSave(func(writer fyne.URIWriteCloser, err error) {
-		if err != nil || writer == nil {
-			return
-		}
-		defer writer.Close()
-		var lines []string
-		lines = append(lines, "# Valid Microsoft Teams Accounts")
-		lines = append(lines, "")
-		for _, account := range validAccounts {
-			lines = append(lines, fmt.Sprintf("%s|%s", account.Email, account.Password))
-		}
-		content := strings.Join(lines, "\n")
-		_, err = writer.Write([]byte(content))
-		if err != nil {
-			at.gui.updateUI <- func() {
-				dialog.ShowError(fmt.Errorf("Failed to write file: %v", err), at.gui.window)
-			}
-			return
-		}
-		at.gui.updateUI <- func() {
-			at.gui.updateStatus(fmt.Sprintf("Exported %d valid accounts", len(validAccounts)))
-			at.addLog(fmt.Sprintf("📤 Exported %d valid accounts", len(validAccounts)))
-		}
-	}, at.gui.window)
+	// Also refresh token info when refreshing accounts
+	at.updateTokenInfo()
 }
 
 func (at *AccountsTab) isValidEmail(email string) bool {

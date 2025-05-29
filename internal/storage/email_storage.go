@@ -527,3 +527,13 @@ func (es *EmailStorage) WriteEmailsToFile(filePath string, emails []string) erro
 func (es *EmailStorage) RemoveEmailFromFile(filePath string, emailToRemove string) error {
 	return es.fileManager.RemoveLineFromFile(filePath, emailToRemove)
 }
+func (es *EmailStorage) GetDB() *sql.DB {
+	es.dbMutex.RLock()
+	defer es.dbMutex.RUnlock()
+
+	if es.isDBClosed {
+		return nil
+	}
+
+	return es.db
+}
