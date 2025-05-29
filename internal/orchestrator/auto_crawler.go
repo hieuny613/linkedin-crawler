@@ -111,7 +111,7 @@ func New(config models.Config) (*AutoCrawler, error) {
 		ac.logWriter.Flush()
 		ac.logFile.Close()
 	}()
-
+	//ac.stateManager.SaveStateOnShutdown()
 	// Setup signal handling
 	utils.SetupSignalHandling(&ac.shutdownRequested, ac.gracefulShutdown, config.SleepDuration)
 
@@ -189,17 +189,24 @@ func (ac *AutoCrawler) printFinalResults() {
 	fmt.Println("🎉 HOÀN THÀNH AUTO LINKEDIN CRAWLER!")
 	fmt.Println(strings.Repeat("=", 80))
 
-	// Get final stats from SQLite (with error handling)
-	stats, err := ac.stateManager.GetEmailStats()
+	// Tạo một storage mới để chắc chắn DB chưa bị closed
+	fresh := storage.NewEmailStorage()
+	if err := fresh.InitDB(); err != nil {
+		fmt.Printf("⚠️ Không thể mở database để lấy stats cuối cùng: %v\n", err)
+		fmt.Printf("📁 Kết quả có thể xem trong file: %s\n", ac.outputFile)
+		return
+	}
+	defer func() {
+		if err := fresh.CloseDB(); err != nil {
+			fmt.Printf("⚠️ Lỗi khi đóng database: %v\n", err)
+		}
+	}()
+
+	// Lấy stats thực sự
+	stats, err := fresh.GetEmailStats()
 	if err != nil {
 		fmt.Printf("⚠️ Không thể lấy stats cuối cùng: %v\n", err)
-
-		// Try to show alternative stats
-		totalOriginal := len(ac.totalEmails)
-		fmt.Printf("📈 TỔNG KẾT (LIMITED):\n")
-		fmt.Printf("   📊 Tổng emails ban đầu:   %d\n", totalOriginal)
-		fmt.Printf("   📁 Kết quả có thể xem trong file: %s\n", ac.outputFile)
-
+		fmt.Printf("📁 Kết quả có thể xem trong file: %s\n", ac.outputFile)
 		return
 	}
 
@@ -210,12 +217,10 @@ func (ac *AutoCrawler) printFinalResults() {
 	hasInfoCount := stats["has_info"]
 	noInfoCount := stats["no_info"]
 
-	// Calculate percentages
 	successPercent := 0.0
 	if totalOriginal > 0 {
 		successPercent = float64(successCount) * 100 / float64(totalOriginal)
 	}
-
 	dataPercent := 0.0
 	if successCount > 0 {
 		dataPercent = float64(hasInfoCount) * 100 / float64(successCount)
@@ -226,7 +231,7 @@ func (ac *AutoCrawler) printFinalResults() {
 	fmt.Printf("   ✅ Đã xử lý thành công:  %d (%.1f%%)\n", successCount, successPercent)
 	fmt.Printf("   ❌ Thất bại:             %d\n", failedCount)
 	fmt.Printf("   ⏳ Chưa xử lý:           %d\n", pendingCount)
-	fmt.Printf("   \n")
+	fmt.Printf("\n")
 	fmt.Printf("   🎯 CÓ THÔNG TIN LINKEDIN: %d emails (%.1f%% trong thành công)\n", hasInfoCount, dataPercent)
 	fmt.Printf("   📭 KHÔNG CÓ THÔNG TIN:   %d emails (%.1f%% trong thành công)\n", noInfoCount, 100-dataPercent)
 
@@ -235,11 +240,9 @@ func (ac *AutoCrawler) printFinalResults() {
 	} else {
 		fmt.Printf("\n😔 Không tìm thấy profile LinkedIn nào\n")
 	}
-
 	if pendingCount > 0 {
 		fmt.Printf("\n💾 Còn %d emails chưa xử lý đã được lưu vào file %s\n", pendingCount, ac.config.EmailsFilePath)
 	}
-
 	fmt.Println(strings.Repeat("=", 80))
 }
 

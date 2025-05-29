@@ -652,3 +652,9 @@ func (at *AccountsTab) updateStats() {
 func (at *AccountsTab) GetAccounts() []models.Account {
 	return at.accounts
 }
+func (at *AccountsTab) Cleanup() {
+	if at.tokenInfoTicker != nil {
+		at.tokenInfoTicker.Stop()
+		at.tokenInfoTicker = nil
+	}
+}

@@ -1027,9 +1027,10 @@ func (et *EmailsTab) finalizeAfterStop() {
 	if et.autoCrawler != nil {
 		// Get final stats from autoCrawler
 		emailStorage, _, _ := et.autoCrawler.GetStorageServices()
+		config := et.autoCrawler.GetConfig()
 		if emailStorage != nil {
 			// Export pending emails back to emails.txt
-			err := emailStorage.ExportPendingEmailsToFile("emails.txt")
+			err := emailStorage.ExportPendingEmailsToFile(config.EmailsFilePath)
 			if err != nil {
 				et.addLog(fmt.Sprintf("⚠️ Không thể export pending emails: %v", err))
 			} else {
@@ -1264,6 +1265,28 @@ func (et *EmailsTab) performEmailCrawling(ctx context.Context) {
 		et.updateStatsFromDatabase()
 		// Refresh current page
 		et.updateDisplayEmails()
+	}
+}
+
+func (et *EmailsTab) Cleanup() {
+	// Stop stats refresh ticker
+	if et.statsRefreshTicker != nil {
+		et.statsRefreshTicker.Stop()
+		et.statsRefreshTicker = nil
+	}
+
+	// Clear cache
+	et.emailStatusCache = nil
+
+	// Clear log buffer to free memory
+	et.logBuffer = nil
+
+	// Close any database connections
+	if et.autoCrawler != nil {
+		emailStorage, _, _ := et.autoCrawler.GetStorageServices()
+		if emailStorage != nil {
+			emailStorage.CloseDB()
+		}
 	}
 }
 

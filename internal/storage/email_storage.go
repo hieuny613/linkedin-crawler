@@ -72,10 +72,10 @@ func (es *EmailStorage) InitDB() error {
 
 	es.isDBClosed = false
 
-	// IMPORTANT: Drop existing table first to start fresh
-	if _, err := es.db.Exec("DROP TABLE IF EXISTS emails"); err != nil {
-		return fmt.Errorf("failed to drop existing emails table: %w", err)
-	}
+	// // IMPORTANT: Drop existing table first to start fresh
+	// if _, err := es.db.Exec("DROP TABLE IF EXISTS emails"); err != nil {
+	// 	return fmt.Errorf("failed to drop existing emails table: %w", err)
+	// }
 
 	// Create fresh table
 	createTableSQL := `
@@ -97,8 +97,6 @@ func (es *EmailStorage) InitDB() error {
 	if _, err := es.db.Exec(createTableSQL); err != nil {
 		return fmt.Errorf("failed to create emails table: %w", err)
 	}
-
-	fmt.Println("✅ Database initialized: Dropped old emails table and created fresh one")
 	return nil
 }
 
@@ -117,13 +115,18 @@ func (es *EmailStorage) CloseDB() error {
 // ensureDB ensures database connection is available
 func (es *EmailStorage) ensureDB() error {
 	es.dbMutex.RLock()
-	if es.db != nil && !es.isDBClosed {
-		es.dbMutex.RUnlock()
-		return nil
-	}
+	dbOpen := es.db != nil && !es.isDBClosed
 	es.dbMutex.RUnlock()
 
-	// Need to initialize
+	if dbOpen {
+		// DB đang mở bình thường → tiếp tục
+		return nil
+	}
+	if es.db != nil && es.isDBClosed {
+		// DB đã từng mở rồi nhưng đã đóng → không tái khởi tạo (tránh mất data)
+		return fmt.Errorf("database has been closed")
+	}
+	// Trường hợp lần đầu khởi tạo
 	return es.InitDB()
 }
 
@@ -140,6 +143,25 @@ func (es *EmailStorage) LoadEmailsFromFile(filePath string) ([]string, error) {
 	// Initialize database (this will drop existing table)
 	if err := es.ensureDB(); err != nil {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
+	}
+	if err := es.ensureDB(); err != nil {
+		return nil, fmt.Errorf("failed to initialize database before drop: %w", err)
+	}
+	if _, err := es.db.Exec("DROP TABLE IF EXISTS emails"); err != nil {
+		return nil, fmt.Errorf("failed to drop existing emails table: %w", err)
+	}
+	// Sau khi drop, cần tạo lại schema (tương tự InitDB)
+	if _, err := es.db.Exec(`
+        CREATE TABLE IF NOT EXISTS emails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE,
+            status TEXT,
+            has_info BOOLEAN,
+            no_info BOOLEAN,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    `); err != nil {
+		return nil, fmt.Errorf("failed to recreate emails table: %w", err)
 	}
 
 	dir := filepath.Dir(filePath)

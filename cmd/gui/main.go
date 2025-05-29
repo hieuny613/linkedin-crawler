@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"linkedin-crawler/internal/utils"
 )
 
+// CrawlerGUI represents the main GUI application
 type CrawlerGUI struct {
 	app    fyne.App
 	window fyne.Window
@@ -42,6 +44,7 @@ type CrawlerGUI struct {
 }
 
 func main() {
+	// Set log flags
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	// Create app data directory
@@ -57,19 +60,38 @@ func main() {
 	fmt.Println("🔄 Checking for duplicates in hit.txt...")
 	utils.AutoDeduplicateOnStartup()
 
+	// Initialize GUI
 	gui := NewCrawlerGUI()
 
-	// Bắt đầu goroutine xử lý mọi cập nhật UI qua channel updateUI
+	// Single dispatcher: mọi cập nhật UI phải chạy qua fyne.Do
 	go func() {
 		for fn := range gui.updateUI {
-			fn()
+			// Schedule on Fyne main event loop
+			fyne.Do(func() {
+				// Recover panic within UI update
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("Panic in UI update: %v\n%s", r, debug.Stack())
+					}
+				}()
+				fn()
+			})
 		}
 	}()
 
+	// Ensure cleanup on panic or exit
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Panic recovered in main: %v\n%s", r, debug.Stack())
+		}
+		gui.cleanup()
+	}()
+
+	// Build UI and load settings
 	gui.setupUI()
 	gui.loadSettings()
 
-	// Kiểm tra file hit.txt và cảnh báo nếu có vấn đề (cũng update qua UI channel)
+	// Validate hit.txt and show dialog if needed
 	gui.updateUI <- func() {
 		if _, err := os.Stat("hit.txt"); err == nil {
 			issues := utils.ValidateHitFile("hit.txt")
@@ -89,9 +111,11 @@ func main() {
 		}
 	}
 
+	// Start the application
 	gui.window.ShowAndRun()
 }
 
+// NewCrawlerGUI creates and returns the GUI instance
 func NewCrawlerGUI() *CrawlerGUI {
 	a := app.NewWithID("com.linkedin.crawler.gui")
 	a.SetIcon(theme.ComputerIcon())
@@ -108,6 +132,7 @@ func NewCrawlerGUI() *CrawlerGUI {
 		isRunning: false,
 		updateUI:  make(chan func(), 100),
 	}
+	// Initialize tabs
 	gui.configTab = NewConfigTab(gui)
 	gui.accountsTab = NewAccountsTab(gui)
 	gui.emailsTab = NewEmailsTab(gui)
@@ -115,6 +140,7 @@ func NewCrawlerGUI() *CrawlerGUI {
 	return gui
 }
 
+// setupUI builds and configures the main window content
 func (gui *CrawlerGUI) setupUI() {
 	tabs := container.NewAppTabs(
 		container.NewTabItem("Config", gui.configTab.CreateContent()),
@@ -125,6 +151,7 @@ func (gui *CrawlerGUI) setupUI() {
 
 	gui.statusBar = widget.NewLabel("Ready")
 
+	// Memory usage label
 	memoryLabel := widget.NewLabel("")
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
@@ -156,7 +183,10 @@ func (gui *CrawlerGUI) setupUI() {
 		tabs,
 	)
 	gui.window.SetContent(content)
+
+	// Intercept close to handle running crawler
 	gui.window.SetCloseIntercept(func() {
+		// Always attempt to stop crawler and exit process
 		if gui.isRunning {
 			dialog.ShowConfirm("Confirm Exit",
 				"Crawler is running. Stop and exit?",
@@ -165,15 +195,18 @@ func (gui *CrawlerGUI) setupUI() {
 						gui.stopCrawler()
 						gui.cleanup()
 						gui.app.Quit()
+						os.Exit(0)
 					}
 				}, gui.window)
 		} else {
 			gui.cleanup()
 			gui.app.Quit()
+			os.Exit(0)
 		}
 	})
 }
 
+// loadSettings pushes initial tab data to the UI
 func (gui *CrawlerGUI) loadSettings() {
 	gui.updateUI <- func() { gui.configTab.LoadConfig() }
 	gui.updateUI <- func() { gui.accountsTab.LoadAccounts() }
@@ -181,68 +214,68 @@ func (gui *CrawlerGUI) loadSettings() {
 	gui.updateUI <- func() { gui.updateStatus("Ready") }
 }
 
+// saveSettings persists current tab data to files
 func (gui *CrawlerGUI) saveSettings() {
 	gui.updateUI <- func() { gui.configTab.SaveConfig() }
 	gui.updateUI <- func() { gui.accountsTab.SaveAccounts() }
 	gui.updateUI <- func() { gui.emailsTab.SaveEmails() }
 }
 
+// startCrawler kicks off the background crawl process
 func (gui *CrawlerGUI) startCrawler() {
 	gui.crawlerMux.Lock()
 	defer gui.crawlerMux.Unlock()
 	if gui.isRunning {
 		return
 	}
+	// Validate inputs
 	if len(gui.accountsTab.accounts) == 0 {
 		gui.updateUI <- func() {
-			dialog.ShowError(fmt.Errorf("No accounts configured"), gui.window)
+			dialog.ShowError(fmt.Errorf("no accounts configured"), gui.window)
 		}
 		return
 	}
 	if len(gui.emailsTab.emails) == 0 {
 		gui.updateUI <- func() {
-			dialog.ShowError(fmt.Errorf("No emails configured"), gui.window)
+			dialog.ShowError(fmt.Errorf("no emails configured"), gui.window)
 		}
 		return
 	}
+
+	// Save before starting
 	gui.saveSettings()
 	progressDialog := dialog.NewProgressInfinite("Starting...", "Initializing...", gui.window)
 	gui.updateUI <- func() { progressDialog.Show() }
+
 	go func() {
-		defer func() {
-			gui.updateUI <- func() { progressDialog.Hide() }
-		}()
+		// Ensure hide dialog
+		defer func() { gui.updateUI <- func() { progressDialog.Hide() } }()
+
 		cfg := gui.configTab.config
 		autoCrawler, err := orchestrator.New(cfg)
 		if err != nil {
 			gui.updateUI <- func() {
-				dialog.ShowError(fmt.Errorf("Failed to initialize: %v", err), gui.window)
+				dialog.ShowError(fmt.Errorf("failed to initialize: %v", err), gui.window)
 			}
 			return
 		}
+
+		// Mark running
 		gui.autoCrawler = autoCrawler
 		gui.isRunning = true
 
-		// Notify emailsTab that crawler started
-		gui.updateUI <- func() {
-			gui.updateStatus("Running...")
-			if gui.emailsTab != nil {
-				gui.emailsTab.OnCrawlerStarted()
-			}
-		}
-
 		err = autoCrawler.Run()
+		// Reset running state
 		gui.crawlerMux.Lock()
 		gui.isRunning = false
 		gui.autoCrawler = nil
 		gui.crawlerMux.Unlock()
 
+		// Notify stop
 		gui.updateUI <- func() {
-			// Notify emailsTab that crawler stopped
 			if gui.emailsTab != nil {
 				gui.emailsTab.OnCrawlerStopped()
 			}
-
 			if err != nil {
 				gui.updateStatus("Stopped with errors")
 			} else {
@@ -251,6 +284,7 @@ func (gui *CrawlerGUI) startCrawler() {
 			}
 		}
 
+		// Show final dialog
 		gui.updateUI <- func() {
 			if gui.window != nil {
 				if err != nil {
@@ -263,38 +297,64 @@ func (gui *CrawlerGUI) startCrawler() {
 	}()
 }
 
+// stopCrawler signals the running crawl to stop
 func (gui *CrawlerGUI) stopCrawler() {
 	gui.crawlerMux.Lock()
 	defer gui.crawlerMux.Unlock()
 	if !gui.isRunning || gui.autoCrawler == nil {
 		return
 	}
-	shutdownRequested := gui.autoCrawler.GetShutdownRequested()
-	if shutdownRequested != nil {
-		*shutdownRequested = 1
+	down := gui.autoCrawler.GetShutdownRequested()
+	if down != nil {
+		*down = 1
 	}
 	gui.updateUI <- func() { gui.updateStatus("Stopping...") }
 }
 
+// cleanup releases all resources before exit
 func (gui *CrawlerGUI) cleanup() {
+	// Cancel background context
 	gui.cancel()
+	// Save settings
 	gui.saveSettings()
 
-	// Stop all refresh tickers
-	if gui.emailsTab != nil && gui.emailsTab.statsRefreshTicker != nil {
-		gui.emailsTab.statsRefreshTicker.Stop()
+	// Clean sub-tabs
+	if gui.emailsTab != nil {
+		gui.emailsTab.Cleanup()
+	}
+	if gui.accountsTab != nil {
+		gui.accountsTab.Cleanup()
 	}
 	if gui.resultsTab != nil {
 		gui.resultsTab.Cleanup()
 	}
-	// Không còn cleanup cho controlTab!
-	if gui.accountsTab != nil && gui.accountsTab.tokenInfoTicker != nil {
-		gui.accountsTab.tokenInfoTicker.Stop()
+
+	// Wait briefly for pending UI ops
+	time.Sleep(100 * time.Millisecond)
+
+	// Close UI dispatcher
+	if gui.updateUI != nil {
+		close(gui.updateUI)
+		gui.updateUI = nil
 	}
+
+	// Force GC
+	runtime.GC()
 }
 
+// updateStatus sets the status bar text
 func (gui *CrawlerGUI) updateStatus(status string) {
 	if gui.statusBar != nil {
 		gui.statusBar.SetText(status)
+	}
+}
+
+// handlePanic recovers and shows a dialog on panic
+func (gui *CrawlerGUI) handlePanic(component string) {
+	if r := recover(); r != nil {
+		log.Printf("Panic in %s: %v\n%s", component, r, debug.Stack())
+		gui.updateUI <- func() {
+			dialog.ShowError(fmt.Errorf("Internal error in %s", component), gui.window)
+		}
 	}
 }

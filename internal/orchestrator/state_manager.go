@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"linkedin-crawler/internal/storage"
 )
 
 // StateManager handles state persistence and management with SQLite
@@ -58,54 +59,40 @@ func (sm *StateManager) GetRemainingEmails() []string {
 
 // SaveStateOnShutdown saves the current state when shutting down - exports pending emails to file
 func (sm *StateManager) SaveStateOnShutdown() {
-	emailStorage, _, _ := sm.autoCrawler.GetStorageServices()
 	config := sm.autoCrawler.GetConfig()
+	fmt.Println("💾 Đang lưu trạng thái trước khi thoát…")
 
-	fmt.Println("💾 Đang lưu trạng thái trước khi thoát...")
-
-	// Get current stats with error handling
-	stats, err := emailStorage.GetEmailStats()
-	if err != nil {
-		fmt.Printf("⚠️ Không thể lấy stats khi shutdown: %v\n", err)
-		// Try to export pending emails anyway
-		err = emailStorage.ExportPendingEmailsToFile(config.EmailsFilePath)
-		if err != nil {
-			fmt.Printf("⚠️ Không thể export pending emails khi shutdown: %v\n", err)
-		} else {
-			fmt.Printf("💾 Đã cố gắng export pending emails vào file emails.txt\n")
-		}
-
-		// Close database connection
-		if err := emailStorage.CloseDB(); err != nil {
-			fmt.Printf("⚠️ Lỗi khi đóng database: %v\n", err)
-		}
+	// 1) Mở 1 kết nối DB mới riêng cho việc export
+	freshStorage := storage.NewEmailStorage()
+	if err := freshStorage.InitDB(); err != nil {
+		fmt.Printf("⚠️ Không thể mở DB để export: %v\n", err)
 		return
 	}
+	defer func() {
+		if err := freshStorage.CloseDB(); err != nil {
+			fmt.Printf("⚠️ Lỗi khi đóng DB: %v\n", err)
+		} else {
+			fmt.Println("✅ Đã đóng DB connection (shutdown)")
+		}
+	}()
 
-	// Export pending emails back to file
-	err = emailStorage.ExportPendingEmailsToFile(config.EmailsFilePath)
+	// 2) Export pending emails về file
+	if err := freshStorage.ExportPendingEmailsToFile(config.EmailsFilePath); err != nil {
+		fmt.Printf("⚠️ Không thể export pending emails: %v\n", err)
+	} else {
+		fmt.Println("💾 Đã export pending emails thành công")
+	}
+
+	// 3) Lấy stats cuối cùng
+	stats, err := freshStorage.GetEmailStats()
 	if err != nil {
-		fmt.Printf("⚠️ Không thể export pending emails khi shutdown: %v\n", err)
-	}
-
-	pendingCount := stats["pending"]
-	successCount := stats["success"]
-	failedCount := stats["failed"]
-
-	if pendingCount == 0 {
-		fmt.Println("📝 Tất cả emails đã được xử lý - file emails.txt trống")
+		fmt.Printf("⚠️ Không thể lấy stats cuối: %v\n", err)
 	} else {
-		fmt.Printf("💾 Đã lưu %d emails pending vào file emails.txt\n", pendingCount)
-	}
-
-	fmt.Printf("📊 Tổng kết: Success: %d | Failed: %d | Pending: %d | HasInfo: %d | NoInfo: %d\n",
-		successCount, failedCount, pendingCount, stats["has_info"], stats["no_info"])
-
-	// Close database connection
-	if err := emailStorage.CloseDB(); err != nil {
-		fmt.Printf("⚠️ Lỗi khi đóng database: %v\n", err)
-	} else {
-		fmt.Println("✅ Đã đóng database connection")
+		fmt.Printf(
+			"📊 Tổng kết: Success: %d | Failed: %d | Pending: %d | HasInfo: %d | NoInfo: %d\n",
+			stats["success"], stats["failed"], stats["pending"],
+			stats["has_info"], stats["no_info"],
+		)
 	}
 }
 
