@@ -184,24 +184,25 @@ func (gui *CrawlerGUI) setupUI() {
 	)
 	gui.window.SetContent(content)
 
-	// Intercept close to handle running crawler
+	// Intercept close để xử lý dừng crawler và thoát
 	gui.window.SetCloseIntercept(func() {
-		// Always attempt to stop crawler and exit process
-		if gui.isRunning {
-			dialog.ShowConfirm("Confirm Exit",
-				"Crawler is running. Stop and exit?",
-				func(confirmed bool) {
-					if confirmed {
-						gui.stopCrawler()
-						gui.cleanup()
-						gui.app.Quit()
-						os.Exit(0)
-					}
-				}, gui.window)
-		} else {
-			gui.cleanup()
-			gui.app.Quit()
-			os.Exit(0)
+		gui.updateUI <- func() {
+			if gui.isRunning {
+				dialog.ShowConfirm("Confirm Exit",
+					"Crawler đang chạy. Dừng và thoát?",
+					func(confirmed bool) {
+						if confirmed {
+							gui.stopCrawler()
+							gui.cleanup()
+							gui.app.Quit()
+							os.Exit(0)
+						}
+					}, gui.window)
+			} else {
+				gui.cleanup()
+				gui.app.Quit()
+				os.Exit(0)
+			}
 		}
 	})
 }

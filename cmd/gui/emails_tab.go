@@ -844,7 +844,9 @@ example@example.com
 func (et *EmailsTab) RefreshEmailsList() {
 	et.LoadEmails()
 	// Also update stats from database when refreshing
-	et.updateStatsFromDatabase()
+	et.gui.updateUI <- func() {
+		et.updateStatsFromDatabase()
+	}
 }
 
 // OPTIMIZATION: Throttled stats update
